@@ -11,6 +11,59 @@ CTestTestfile.cmake
 _deps
 CMakeUserPresets.json
 
+# ---------------------------------------------------------------
+# 构建输出（CMakePresets 生成的目录: build/Debug, build/Release ...）
+# ---------------------------------------------------------------
+build/
+out/
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+*.d
+
+# ---------------------------------------------------------------
+# 调试 / 工具链辅助文件
+# ---------------------------------------------------------------
+*.o
+*.obj
+*.a
+*.la
+*.log
+.gdb_history
+openocd.log
+
+# ---------------------------------------------------------------
+# VS Code —— 只保留团队共享的调试与任务配置
+# ---------------------------------------------------------------
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+
+# ---------------------------------------------------------------
+# 操作系统 / 编辑器临时文件
+# ---------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.bak
+*.orig
+*.rej
+
+# ---------------------------------------------------------------
+# STM32CubeMX / STM32CubeIDE 中间文件
+# 注: .ioc、.mxproject、*.ld、*.s、SVD 需要纳入版本管理，勿忽略
+# ---------------------------------------------------------------
+*.rpt
+*.htm
+*.su~
+Release/
+Debug/
+
 # CLion
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

@@ -1,0 +1,87 @@
+{
+    // 使用 IntelliSense 了解相关属性。
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://github.com/Marus/cortex-debug/blob/master/README.md
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "J-Link Debug",
+            "type": "cortex-debug",
+            "request": "launch",
+
+            // 工作区路径
+            "cwd": "${workspaceFolder}",
+
+            // 目标可执行文件 (ELF)
+            "executable": "${workspaceFolder}/build/Debug/XDriver.elf",
+
+            // 调试服务器类型: J-Link GDB Server
+            "servertype": "jlink",
+
+            // J-Link GDB Server 路径（使用命令行版，后台静默运行）
+            "serverpath": "E:\\06_Program\\JLink_V962\\JLinkGDBServerCL.exe",
+
+            // SVD 文件路径 — 用于在调试时显示外设寄存器状态
+            "svdFile": "${workspaceFolder}/STM32F103.svd",
+
+            // 目标芯片型号 (J-Link 使用芯片名称)
+            "device": "STM32F103CB",
+
+            // 启动后自动运行到 main() 入口
+            // 注意: runToMain 在 cortex-debug 1.x 中已弃用，改用 runToEntryPoint
+            "runToEntryPoint": "main",
+
+            // 在启动调试前先自动执行 Build 任务
+            "preLaunchTask": "Build",
+
+            // ARM GCC 工具链中的 GDB
+            // 如果 arm-none-eabi-gdb 不在 PATH 中，请指定完整路径
+            "gdbPath": "arm-none-eabi-gdb",
+
+            // 接口类型: SWD (STM32 常用)
+            "interface": "swd",
+
+            // SWD 速度 — cortex-debug 没有 speed 选项，需通过 serverArgs 传给 J-Link GDB Server
+            // (-speed 单位 kHz；杜邦线连接建议 1000，板载调试器可用 4000)
+            "serverArgs": [
+                "-speed",
+                "1000"
+            ],
+
+            // 使用 reset halt 代替 reset+halt 两条命令，避免竞争条件
+            "preLaunchCommands": [
+                "monitor reset halt"
+            ],
+
+            // 复位后自动暂停（使用 runToEntryPoint 时此项被忽略）
+            "breakAfterReset": false,
+
+            // 烧录完成后执行的命令
+            "postLaunchCommands": [],
+
+            // 调试输出: "none" | "parsed" | "raw" | "both" | "vscode"
+            // 排查问题时改成 "both"
+            "showDevDebugOutput": "none",
+            "showDevDebugTimestamps": false
+        },
+        {
+            "name": "J-Link Debug (Attach)",
+            "type": "cortex-debug",
+            "request": "attach",
+
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/XDriver.elf",
+            "servertype": "jlink",
+            "serverpath": "E:\\06_Program\\JLink_V962\\JLinkGDBServerCL.exe",
+            "svdFile": "${workspaceFolder}/STM32F103.svd",
+            "device": "STM32F103CB",
+            "gdbPath": "arm-none-eabi-gdb",
+            "interface": "swd",
+            "serverArgs": [
+                "-speed",
+                "1000"
+            ],
+            "showDevDebugOutput": "none"
+        }
+    ]
+}
