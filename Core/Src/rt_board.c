@@ -20,6 +20,19 @@
 #include "rt_board.h"
 
 /*
+ * CubeMX (CoupleFile = true) 把各外设初始化拆到了独立文件,
+ * 这些 MX_*_Init() 由本文件的 rt_hw_board_init() 统一调用,
+ * 因此必须在这里包含对应的头文件 (main.c 不再负责外设初始化)。
+ */
+#include "gpio.h"
+#include "dma.h"
+#include "usart.h"
+#include "adc.h"
+#include "can.h"
+#include "spi.h"
+#include "tim.h"
+
+/*
  * 控制台引脚选择:
  *   1 = PB6(TX) / PB7(RX)  -- 默认, USART1 重映射
  *   0 = PA9(TX) / PA10(RX) -- 备用, PB6/PB7 电路有问题时可用
@@ -165,12 +178,18 @@ void rt_hw_board_init(void)
 {
     GPIO_InitTypeDef gpio = {0};
 
-    /* 1) HAL + 时钟 + 外设 (复用 CubeMX 生成的初始化函数) */
+    /* 1) HAL + 时钟 + 外设 (复用 CubeMX 生成的初始化函数)
+     *    顺序与源工程 (Dummy-Robot Ctrl-Step-Driver) 的 main() 保持一致 */
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
     MX_DMA_Init();
+    MX_ADC1_Init();
     MX_USART1_UART_Init();
+    MX_CAN_Init();
+    MX_SPI1_Init();
+    MX_TIM2_Init();
+    MX_TIM4_Init();
 
     /* 2) RX 引脚配置为上拉输入 (CubeMX 生成的是 NOPULL / 重映射由 CMSIS 宏控制)
      *    F1 的 GPIO: INPUT + PULLUP => CNF=10, MODE=00, ODR=1 */

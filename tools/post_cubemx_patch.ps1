@@ -7,6 +7,8 @@
 
       1. startup_*.s          Reset_Handler:  bl main  ->  bl entry
       2. *.ld (linker script) add .rti_fn / .fsymtab / .vsymtab output sections
+                              FLASH LENGTH -> 0x17C00 (reserve last 33KB for
+                              the calibration table + config page)
       3. Core/Src/stm32f1xx_it.c
                               remove HardFault_Handler and PendSV_Handler
                               (provided by RT-Thread libcpu context_gcc.S)
@@ -238,6 +240,27 @@ else {
             $new = $t.Substring(0, $lineStart) + $sections + $indent + $t.Substring($idx)
             Apply-Patch $linker.FullName $t $new "$($linker.Name): add .rti_fn / .fsymtab / .vsymtab"
         }
+    }
+
+    # 2.2 Reserve the last 33KB of flash.
+    #     Code area must end at 0x08017C00 so that:
+    #       0x08017C00 - 0x0801FBFF  32KB  encoder calibration table
+    #       0x0801FC00 - 0x0801FFFF   1KB  BoardConfig page
+    #     CubeMX regenerates this file with LENGTH = 128K, which silently lets
+    #     the linker place code over the calibration data - no error, just a
+    #     corrupted table at runtime.
+    $t = Read-Text $linker.FullName
+    $flashLine = '(?m)^([ \t]*FLASH[ \t]*\(rx\)[ \t]*:[ \t]*ORIGIN[ \t]*=[ \t]*0x[0-9A-Fa-f]+[ \t]*,[ \t]*LENGTH[ \t]*=[ \t]*)([^ \t\r\n]+)'
+    $m = [regex]::Match($t, $flashLine)
+    if (-not $m.Success) {
+        Add-Warning "$($linker.Name): FLASH MEMORY line not found, set LENGTH = 0x17C00 manually"
+    }
+    elseif ($m.Groups[2].Value -eq '0x17C00') {
+        Add-Skip "$($linker.Name): FLASH LENGTH already 0x17C00 (95KB)"
+    }
+    else {
+        $new = [regex]::Replace($t, $flashLine, '${1}0x17C00')
+        Apply-Patch $linker.FullName $t $new "$($linker.Name): FLASH LENGTH $($m.Groups[2].Value) -> 0x17C00 (reserve last 33KB)"
     }
 }
 

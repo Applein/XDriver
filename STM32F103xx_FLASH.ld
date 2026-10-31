@@ -56,7 +56,14 @@ ENTRY(Reset_Handler)
 MEMORY
 {
 RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 20K
-FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 128K
+/*
+ * 代码区只保留 95KB (0x17C00), 末尾留出:
+ *   0x08017C00 - 0x0801FBFF  32KB  编码器校准表 (STOCKPILE_APP_CALI_ADDR)
+ *   0x0801FC00 - 0x0801FFFF   1KB  BoardConfig 配置页 (STOCKPILE_APP_DATA_ADDR)
+ * 若把 LENGTH 改回 128K, 链接器会把代码铺到校准表所在扇区,
+ * 导致校准数据被覆盖且不会报错。
+ */
+FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 0x17C00
 }
 
 /* Highest address of the user mode stack */

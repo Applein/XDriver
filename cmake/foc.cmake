@@ -40,8 +40,8 @@ set(FOC_SRC
     ${FOC_DIR}/Ctrl/Signal/led_base.c
 
     # --- 阶段 B: 信号层 Port (依赖 CubeMX 引脚标签, 阶段 D 后启用) ---
-    # ${FOC_DIR}/Port/button_stm32.c   # 需要 BUTTON1_Pin / BUTTON2_Pin
-    # ${FOC_DIR}/Port/led_stm32.c      # 需要 LED1_Pin / LED2_Pin
+    ${FOC_DIR}/Port/button_stm32.c   # BUTTON1_Pin / BUTTON2_Pin
+    ${FOC_DIR}/Port/led_stm32.c      # LED1_Pin / LED2_Pin
 )
 
 # ---------------------------------------------------------------------------
