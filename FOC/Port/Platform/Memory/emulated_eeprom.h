@@ -4,11 +4,16 @@
 
 /* Includes ------------------------------------------------------------------*/
 
-#ifdef __cplusplus
-extern "C" {
+/*
+ * C 化修正: 上游把 HAL 头文件放在 extern "C" { ... } 块里面,
+ * 于是只有 C++ 编译单元才会真正包含它们, 纯 C 编译时报
+ * "unknown type name 'uint8_t'"。这里把包含移到 guard 外面。
+ */
 #include <stm32f103xb.h>
 #include <stm32f1xx_hal.h>
 
+#ifdef __cplusplus
+extern "C" {
 #endif
 
 /* Exported types ------------------------------------------------------------*/
@@ -77,8 +82,8 @@ uint8_t eeprom_read_byte(uint32_t pos);
 void eeprom_write_byte(uint32_t pos, uint8_t value);
 
 #if !defined(DATA_EEPROM_BASE)
-void eeprom_buffer_fill();
-void eeprom_buffer_flush();
+void eeprom_buffer_fill(void);
+void eeprom_buffer_flush(void);
 uint8_t eeprom_buffered_read_byte(uint32_t pos);
 void eeprom_buffered_write_byte(uint32_t pos, uint8_t value);
 #endif /* ! DATA_EEPROM_BASE */

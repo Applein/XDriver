@@ -1,204 +1,195 @@
+/*
+ * motor.h
+ *
+ * 上游: Ctrl/Motor/motor.h  (class Motor + 嵌套 class Controller)
+ *
+ * C 化设计 (模式 3: 纯组合 + self 参数):
+ *   1. 嵌套类 Motor::Controller 提升为顶层 struct MotionController。
+ *   2. Motor 与 MotionController 互相引用 (Controller 需要 Motor*,
+ *      Motor 内嵌 Controller), 用前置声明 + 指针打破循环:
+ *          typedef struct Motor Motor;
+ *          struct MotionController { Motor *context; ... };
+ *          struct Motor { ... MotionController controller_instance; ... };
+ *   3. Motor 保留 controller 指针 (= &controller_instance), 使上游
+ *      `motor.controller->state` 这类访问在 C 里写作 `motor->controller->state`,
+ *      字段名完全不变, 便于与上游逐行对照。
+ *   4. 上游 Controller::CloseLoopControlTick() 里的函数内 static bool isFirstCalled
+ *      提升为 MotionController.is_first_called 字段。
+ *   5. 上游 Motor 的成员常量与 Mode_t/State_t 已移到 Motor/motor_types.h
+ *      (Signal 层的 led_base 需要 MotorState, 但不应包含整个 motor.h)。
+ *
+ *   注意: 上游 `motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS` 这种"通过对象访问常量"
+ *   的写法在 C 里改成直接使用 MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS。
+ */
+
 #ifndef CTRL_STEP_FW_MOTOR_H
 #define CTRL_STEP_FW_MOTOR_H
 
-#include "Motor/motion_planner.h"
-#include "Sensor/Encoder/encoder_base.h"
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "Driver/driver_base.h"
+#include "Motor/motion_planner.h"
+#include "Motor/motor_types.h"
+#include "Sensor/Encoder/encoder_base.h"
 
-class Motor
+typedef struct Motor Motor;
+
+/* -------------------------------------------------------------------------- */
+/* 上游: Motor::Controller::PID_t                                             */
+/* -------------------------------------------------------------------------- */
+typedef struct
 {
-public:
-    Motor() :
-        controller(&controllerInstance)
-    {
-        /****************** Default Configs *******************/
-        config.motionParams.encoderHomeOffset = 0;
-        config.motionParams.caliCurrent = 2000;             // (mA)
-        config.motionParams.ratedCurrent = 1000;            // (mA)
-        config.motionParams.ratedCurrentAcc = 2 * 1000;     // (mA/s)
-        config.motionParams.ratedVelocity = 30 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;
-        config.motionParams.ratedVelocityAcc = 1000 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;
+    bool kp_valid;
+    bool ki_valid;
+    bool kd_valid;
+    int32_t kp;
+    int32_t ki;
+    int32_t kd;
+    int32_t v_error;
+    int32_t v_error_last;
+    int32_t output_kp;
+    int32_t output_ki;
+    int32_t output_kd;
+    int32_t integral_round;
+    int32_t integral_remainder;
+    int32_t output;
+} ControllerPid;
 
-        config.ctrlParams.stallProtectSwitch = false;
-        config.ctrlParams.pid =
-            Controller::PID_t{
-                .kp = 5,
-                .ki = 30,
-                .kd = 0
-            };
-        config.ctrlParams.dce =
-            Controller::DCE_t{
-                .kp = 200,
-                .kv = 80,
-                .ki = 300,
-                .kd = 250
-            };
+/* -------------------------------------------------------------------------- */
+/* 上游: Motor::Controller::DCE_t                                             */
+/* -------------------------------------------------------------------------- */
+typedef struct
+{
+    int32_t kp;
+    int32_t kv;
+    int32_t ki;
+    int32_t kd;
+    int32_t p_error;
+    int32_t v_error;
+    int32_t output_kp;
+    int32_t output_ki;
+    int32_t output_kd;
+    int32_t integral_round;
+    int32_t integral_remainder;
+    int32_t output;
+} ControllerDce;
 
-        /*****************************************************/
+/* -------------------------------------------------------------------------- */
+/* 上游: Motor::Controller::Config_t                                          */
+/* -------------------------------------------------------------------------- */
+typedef struct
+{
+    ControllerPid pid;
+    ControllerDce dce;
 
+    bool stall_protect_switch;
+} ControllerConfig;
 
-        motionPlanner.AttachConfig(&config.motionParams);
-        controller->AttachConfig(&config.ctrlParams);
-    }
+/* -------------------------------------------------------------------------- */
+/* 上游: class Motor::Controller                                              */
+/* -------------------------------------------------------------------------- */
+typedef struct
+{
+    Motor *context;                 /* 上游: Motor* context (private) */
 
+    ControllerConfig *config;       /* 上游: Config_t* config = nullptr */
 
-    const int32_t MOTOR_ONE_CIRCLE_HARD_STEPS = 200; // for 1.8° step-motors
-    const int32_t SOFT_DIVIDE_NUM = 256;
-    const int32_t MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS = MOTOR_ONE_CIRCLE_HARD_STEPS * SOFT_DIVIDE_NUM;
+    /* ---- 上游 public 成员 ---- */
+    MotorMode request_mode;
+    MotorMode mode_running;
+    MotorState state;
+    bool is_stalled;
 
-    typedef enum
-    {
-        MODE_STOP,
-        MODE_COMMAND_POSITION,
-        MODE_COMMAND_VELOCITY,
-        MODE_COMMAND_CURRENT,
-        MODE_COMMAND_Trajectory,
-        MODE_PWM_POSITION,
-        MODE_PWM_VELOCITY,
-        MODE_PWM_CURRENT,
-        MODE_STEP_DIR,
-    } Mode_t;
+    /* ---- 上游 private 成员 ---- */
+    int32_t real_lap_position;
+    int32_t real_lap_position_last;
+    int32_t real_position;
+    int32_t real_position_last;
+    int32_t est_velocity;
+    int32_t est_velocity_integral;
+    int32_t est_lead_position;
+    int32_t est_position;
+    int32_t est_error;
+    int32_t foc_current;
+    int32_t goal_position;
+    int32_t goal_velocity;
+    int32_t goal_current;
+    bool goal_disable;
+    bool goal_brake;
+    int32_t soft_position;
+    int32_t soft_velocity;
+    int32_t soft_current;
+    bool soft_disable;
+    bool soft_brake;
+    bool soft_new_curve;
+    int32_t foc_position;
+    uint32_t stalled_time;
+    uint32_t overload_time;
+    bool overload_flag;
 
-    typedef enum
-    {
-        STATE_STOP,
-        STATE_FINISH,
-        STATE_RUNNING,
-        STATE_OVERLOAD,
-        STATE_STALL,
-        STATE_NO_CALIB
-    } State_t;
+    /* ---- 取代上游 CloseLoopControlTick() 内 static bool isFirstCalled ---- */
+    bool is_first_called;
+} MotionController;
 
+/* 上游: Controller 的公开方法 (friend Motor 的私有方法放在 motor.c 内部声明) */
+void motion_ctrl_init(MotionController *self);
+void motion_ctrl_set_ctrl_mode(MotionController *self, MotorMode mode);
+void motion_ctrl_set_current_set_point(MotionController *self, int32_t current);
+void motion_ctrl_set_velocity_set_point(MotionController *self, int32_t velocity);
+void motion_ctrl_set_position_set_point(MotionController *self, int32_t position);
+bool motion_ctrl_set_position_set_point_with_time(MotionController *self, int32_t position,
+                                                  float time_s);
+float motion_ctrl_get_position(MotionController *self, bool is_lap);
+float motion_ctrl_get_velocity(MotionController *self);
+float motion_ctrl_get_foc_current(MotionController *self);
+void motion_ctrl_add_trajectory_set_point(MotionController *self, int32_t position,
+                                         int32_t velocity);
+void motion_ctrl_set_disable(MotionController *self, bool disable);
+void motion_ctrl_set_brake(MotionController *self, bool brake);
+void motion_ctrl_apply_pos_as_home_offset(MotionController *self);
+void motion_ctrl_clear_stall_flag(MotionController *self);
 
-    class Controller
-    {
-    public:
-        friend Motor;
+/* -------------------------------------------------------------------------- */
+/* 上游: struct Motor::Config_t                                               */
+/* -------------------------------------------------------------------------- */
+typedef struct
+{
+    MotionPlannerConfig motion_params;
+    ControllerConfig ctrl_params;
+} MotorConfig;
 
-        typedef struct
-        {
-            bool kpValid, kiValid, kdValid;
-            int32_t kp, ki, kd;
-            int32_t vError, vErrorLast;
-            int32_t outputKp, outputKi, outputKd;
-            int32_t integralRound;
-            int32_t integralRemainder;
-            int32_t output;
-        } PID_t;
+/* -------------------------------------------------------------------------- */
+/* 上游: class Motor                                                          */
+/* -------------------------------------------------------------------------- */
+struct Motor
+{
+    MotorConfig config;
 
-        typedef struct
-        {
-            int32_t kp, kv, ki, kd;
-            int32_t pError, vError;
-            int32_t outputKp, outputKi, outputKd;
-            int32_t integralRound;
-            int32_t integralRemainder;
-            int32_t output;
-        } DCE_t;
+    MotionPlanner motion_planner;
 
-        typedef struct
-        {
-            PID_t pid;
-            DCE_t dce;
+    MotionController controller_instance;   /* 上游 private: Controller controllerInstance */
+    MotionController *controller;           /* = &controller_instance */
 
-            bool stallProtectSwitch;
-        } Config_t;
-
-
-        explicit Controller(Motor* _context)
-        {
-            context = _context;
-
-            requestMode = MODE_STOP;
-            modeRunning = MODE_STOP;
-        }
-
-
-        Config_t* config = nullptr;
-        Mode_t requestMode;
-        Mode_t modeRunning;
-        State_t state = STATE_STOP;
-        bool isStalled = false;
-
-
-        void Init();
-        void SetCtrlMode(Mode_t _mode);
-        void SetCurrentSetPoint(int32_t _cur);
-        void SetVelocitySetPoint(int32_t _vel);
-        void SetPositionSetPoint(int32_t _pos);
-        bool SetPositionSetPointWithTime(int32_t _pos, float _time);
-        float GetPosition(bool _isLap = false);
-        float GetVelocity();
-        float GetFocCurrent();
-        void AddTrajectorySetPoint(int32_t _pos, int32_t _vel);
-        void SetDisable(bool _disable);
-        void SetBrake(bool _brake);
-        void ApplyPosAsHomeOffset();
-        void ClearStallFlag();
-
-
-    private:
-        Motor* context;
-        int32_t realLapPosition{};
-        int32_t realLapPositionLast{};
-        int32_t realPosition{};
-        int32_t realPositionLast{};
-        int32_t estVelocity{};
-        int32_t estVelocityIntegral{};
-        int32_t estLeadPosition{};
-        int32_t estPosition{};
-        int32_t estError{};
-        int32_t focCurrent{};
-        int32_t goalPosition{};
-        int32_t goalVelocity{};
-        int32_t goalCurrent{};
-        bool goalDisable{};
-        bool goalBrake{};
-        int32_t softPosition{};
-        int32_t softVelocity{};
-        int32_t softCurrent{};
-        bool softDisable{};
-        bool softBrake{};
-        bool softNewCurve{};
-        int32_t focPosition{};
-        uint32_t stalledTime{};
-        uint32_t overloadTime{};
-        bool overloadFlag{};
-
-
-        void AttachConfig(Config_t* _config);
-        void CalcCurrentToOutput(int32_t current);
-        void CalcPidToOutput(int32_t _speed);
-        void CalcDceToOutput(int32_t _location, int32_t _speed);
-        void ClearIntegral() const;
-
-        static int32_t CompensateAdvancedAngle(int32_t _vel);
-    };
-
-
-    struct Config_t
-    {
-        MotionPlanner::Config_t motionParams{};
-        Controller::Config_t ctrlParams{};
-    };
-    Config_t config;
-
-    MotionPlanner motionPlanner;
-    Controller* controller = nullptr;
-    EncoderBase* encoder = nullptr;
-    DriverBase* driver = nullptr;
-
-
-    void Tick20kHz();
-    void AttachEncoder(EncoderBase* _encoder);
-    void AttachDriver(DriverBase* _driver);
-
-
-private:
-    Controller controllerInstance = Controller(this);
-
-
-    void CloseLoopControlTick();
+    EncoderBase *encoder;
+    DriverBase *driver;
 };
 
-#endif
+/*
+ * 上游: Motor() 构造函数
+ *   写默认 MotionPlannerConfig / ControllerConfig, 并挂接两个 config 指针
+ *   (motionPlanner.AttachConfig / controller->AttachConfig)。
+ *   只做内存初始化与指针挂接, 不访问外设、不依赖 boardConfig。
+ */
+void motor_init(Motor *self);
+
+/* 上游: void Motor::AttachEncoder(EncoderBase*) */
+void motor_attach_encoder(Motor *self, EncoderBase *encoder);
+
+/* 上游: void Motor::AttachDriver(DriverBase*) */
+void motor_attach_driver(Motor *self, DriverBase *driver);
+
+/* 上游: void Motor::Tick20kHz()   —— 20 kHz 中断内调用 */
+void motor_tick_20khz(Motor *self);
+
+#endif /* CTRL_STEP_FW_MOTOR_H */

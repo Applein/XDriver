@@ -1,179 +1,46 @@
-#ifndef FlashStorage_STM32_h
-#define FlashStorage_STM32_h
+/*
+ * eeprom_interface.h
+ *
+ * 上游: Port/Platform/Memory/eeprom_interface.h
+ *       该文件把 FlashStorage_STM32 库的宏、eeprom_buffer 定义、字节读写函数
+ *       与 class EEPROM (含模板 get<T>/put<T>) 全部塞在一个头文件里。
+ *       C 语言下必须在头文件里放"定义"和多处函数实现 -> 多 TU 重定义,
+ *       因此这里改为: 头文件只留声明, 实现放到 eeprom_interface.c。
+ *
+ * C 化改动:
+ *   1. 删除 class EEPROM 与模板 get<T>/put<T>
+ *      -> eeprom_get_blob() / eeprom_put_blob()  (按字节长度搬运)
+ *   2. 存储位置不变: Flash 最后一页 1KB
+ *        FLASH_BASE_ADDRESS = FLASH_END + 1 - FLASH_PAGE_SIZE
+ *        STM32F103CBT6 => 0x0801FC00, 与 stockpile_config.h 的
+ *        STOCKPILE_APP_DATA_ADDR 是同一页。本工程只用其中一个
+ *        (stockpile_data 未被使用), 不会互相覆盖。
+ *   3. 实现依赖 emulated_eeprom.c (Stm32_eeprom_emulation 库,
+ *      缓冲 + 整页擦除 + 双字编程)
+ *
+ * 行为差异说明 (与上游 EEPROM 类对比):
+ *   上游 EEPROM::put() 在 _commitASAP = true 时立即写 Flash;
+ *   本实现 eeprom_put_blob() 同样立即落盘。
+ *   上游 EEPROM() 构造会初始化, get/put 首次调用时才 fill; 本实现每次
+ *   eeprom_get_blob() 都 fill 一次 (1KB memcpy, 只在配置变更流程里调用,
+ *   不影响 20 kHz 控制环)。
+ *
+ * 注意: 擦写一页会让 CPU 阻塞数毫秒到数十毫秒 (取决于页大小与等待周期),
+ *       因此调用方必须保证此时电机处于停止/休眠状态, 且不要在临界区内调用。
+ */
 
+#ifndef CTRL_STEP_FW_EEPROM_INTERFACE_H
+#define CTRL_STEP_FW_EEPROM_INTERFACE_H
 
-#if !(defined(STM32F0) || defined(STM32F1) || defined(STM32F2) || defined(STM32F3) || defined(STM32F4) || defined(STM32F7) || \
-       defined(STM32L0) || defined(STM32L1) || defined(STM32L4) || defined(STM32H7) || defined(STM32G0) || defined(STM32G4) || \
-       defined(STM32WB) || defined(STM32MP1) || defined(STM32L5))
-#error This code is intended to run on STM32F/L/H/G/WB/MP1 platform! Please check your Tools->Board setting.
-#endif
+#include <stdint.h>
 
-#define FLASH_STORAGE_STM32_VERSION     "FlashStorage_STM32 v1.1.0"
+/* EEPROM 模拟区容量 (字节): 最后一页 1KB */
+#define EEPROM_EMU_SIZE     1024U
 
-// Only use this with emulated EEPROM, without integrated EEPROM
-#if !defined(DATA_EEPROM_BASE)
+/* 从模拟 EEPROM 读取一段数据 (offset + len 必须落在 EEPROM_EMU_SIZE 内) */
+void eeprom_get_blob(uint16_t offset, void *dst, uint16_t len);
 
-#include "emulated_eeprom.h"
+/* 写入一段数据到模拟 EEPROM 并立即落盘 (会擦除整页) */
+void eeprom_put_blob(uint16_t offset, const void *src, uint16_t len);
 
-class EEPROM
-{
-public:
-
-    EEPROM() : _initialized(false), _dirtyBuffer(false), _commitASAP(true), _validEEPROM(true)
-    {}
-
-    /**
-     * Read an eeprom cell
-     * @param index
-     * @return value
-     */
-    uint8_t read(int address)
-    {
-        if (!_initialized)
-            init();
-
-        return eeprom_buffered_read_byte(address);
-    }
-
-    /**
-     * Update an eeprom cell
-     * @param index
-     * @param value
-     */
-    void update(int address, uint8_t value)
-    {
-        if (!_initialized)
-            init();
-
-        if (eeprom_buffered_read_byte(address) != value)
-        {
-            _dirtyBuffer = true;
-            eeprom_buffered_write_byte(address, value);
-        }
-    }
-
-    /**
-     * Write value to an eeprom cell
-     * @param index
-     * @param value
-     */
-    void write(int address, uint8_t value)
-    {
-        update(address, value);
-    }
-
-    /**
-     * Update eeprom cells from an object
-     * @param index
-     * @param value
-     */
-    //Functionality to 'get' and 'put' objects to and from EEPROM.
-    template<typename T>
-    T &get(int _offset, T &_t)
-    {
-        // Copy the data from the flash to the buffer if not yet
-        if (!_initialized)
-            init();
-
-        uint16_t offset = _offset;
-        uint8_t* _pointer = (uint8_t*) &_t;
-
-        for (uint16_t count = sizeof(T); count; --count, ++offset)
-        {
-            *_pointer++ = eeprom_buffered_read_byte(offset);
-        }
-
-        return _t;
-    }
-
-    template<typename T>
-    const T &put(int idx, const T &t)
-    {
-        // Copy the data from the flash to the buffer if not yet
-        if (!_initialized)
-            init();
-
-        uint16_t offset = idx;
-
-        const uint8_t* _pointer = (const uint8_t*) &t;
-
-        for (uint16_t count = sizeof(T); count; --count, ++offset)
-        {
-            eeprom_buffered_write_byte(offset, *_pointer++);
-        }
-
-        if (_commitASAP)
-        {
-            // Save the data from the buffer to the flash right away
-            eeprom_buffer_flush();
-
-            _dirtyBuffer = false;
-            _validEEPROM = true;
-        } else
-        {
-            // Delay saving the data from the buffer to the flash. Just flag and wait for commit() later
-            _dirtyBuffer = true;
-        }
-
-        return t;
-    }
-
-    /**
-     * Check whether the eeprom data is valid
-     * @return true, if eeprom data is valid (has been written at least once), false if not
-     */
-    bool isValid()
-    {
-        return _validEEPROM;
-    }
-
-    /**
-     * Write previously made eeprom changes to the underlying flash storage
-     * Use this with care: Each and every commit will harm the flash and reduce it's lifetime (like with every flash memory)
-     */
-    void commit()
-    {
-        if (!_initialized)
-            init();
-
-        if (_dirtyBuffer)
-        {
-            // Save the data from the buffer to the flash
-            eeprom_buffer_flush();
-
-            _dirtyBuffer = false;
-            _validEEPROM = true;
-        }
-    }
-
-    uint16_t length()
-    { return E2END + 1; }
-
-    void setCommitASAP(bool value = true)
-    { _commitASAP = value; }
-    bool getCommitASAP()
-    { return _commitASAP; }
-
-private:
-
-    void init()
-    {
-        // Copy the data from the flash to the buffer
-        eeprom_buffer_fill();
-        _initialized = true;
-    }
-
-    bool _initialized;
-    bool _dirtyBuffer;
-    bool _commitASAP;
-    bool _validEEPROM;
-};
-
-
-#else
-
-#include "EEPROM.h"
-
-#endif    // #if !defined(DATA_EEPROM_BASE)
-
-#endif    //#ifndef FlashAsEEPROM_SAMD_h
+#endif /* CTRL_STEP_FW_EEPROM_INTERFACE_H */

@@ -30,6 +30,7 @@
 /* USER CODE BEGIN Includes */
 #include <rtthread.h>
 #include "rt_board.h"
+#include "app_foc.h"        /* foc_app_init() */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -114,7 +115,13 @@ int main(void)
   /* Initialize all configured peripherals */
   /* USER CODE BEGIN 2 */
   /* 注意: HAL/时钟/外设/堆/OS tick 已在 rt_hw_board_init() 中完成,
-     控制台是 USART1 (PB6=TX / PB7=RX, 115200 8N1), 在终端输入 help 查看 msh 命令 */
+     控制台是 USART1 (PB6=TX / PB7=RX, 115200 8N1), 在终端输入 help 查看 msh 命令
+
+     foc_app_init() 完成:
+       载入 EEPROM 配置 -> 构建 motor -> 挂驱动/编码器 -> 启动 100Hz 家务线程
+       -> 最后 HAL_TIM_Base_Start_IT(&htim4) 开始 20kHz 闭环
+     之后用 msh 命令调试: foc_status / foc_cali / foc_mode / foc_pos / foc_vel / foc_cur */
+  foc_app_init();
   /* USER CODE END 2 */
 
   /* Infinite loop */

@@ -151,15 +151,64 @@ arm-none-eabi-gcc <同上 flags> \
 | 类型定义 | `Ctrl/Motor/motor_types.h` | ✅ 完成 |
 | 信号层 base | `Ctrl/Signal/button_base.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
 | 信号层 base | `Ctrl/Signal/led_base.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
-| 信号层 Port | `Port/button_stm32.{h,c}` | ✅ 转换完成，**待阶段 D 引脚标签**后入 `FOC_SRC` |
-| 信号层 Port | `Port/led_stm32.{h,c}` | ✅ 转换完成，**待阶段 D 引脚标签**后入 `FOC_SRC` |
-| 驱动层 base | `Ctrl/Driver/…` | ⬜ 未开始 |
-| 编码器层 | `Ctrl/Sensor/Encoder/…` | ⬜ 未开始 |
-| 规划器 | `Ctrl/Motor/motion_planner.*` | ⬜ 未开始 |
-| 电机 | `Ctrl/Motor/motor.*` | ⬜ 未开始 |
-| 校准器 | `Ctrl/Sensor/Encoder/encoder_calibrator_base.*` | ⬜ 未开始 |
-| 存储层 | `Port/Platform/Memory/…` | ⬜ 未开始 |
-| 应用层 | `UserApp/app_foc.{h,c}` | ⬜ 未开始 |
+| 信号层 Port | `Port/button_stm32.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 信号层 Port | `Port/led_stm32.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 驱动层 | `Ctrl/Driver/sin_map.{h,c}` | ✅ 完成（数组拆到 `.c`），已入 `FOC_SRC` |
+| 驱动层 | `Ctrl/Driver/driver_base.h` | ✅ 完成（虚表） |
+| 驱动层 | `Ctrl/Driver/tb67h450_base.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 驱动层 Port | `Port/tb67h450_stm32.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 编码器层 | `Ctrl/Sensor/Encoder/encoder_base.h` | ✅ 完成（虚表） |
+| 编码器层 | `Ctrl/Sensor/Encoder/mt6816_base.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 编码器层 Port | `Port/mt6816_stm32.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 规划器 | `Ctrl/Motor/motion_planner.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 电机 | `Ctrl/Motor/motor.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 校准器 | `Ctrl/Sensor/Encoder/encoder_calibrator_base.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 校准器 Port | `Port/encoder_calibrator_stm32.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
+| 存储层 | `Port/Platform/Memory/{stockpile_f103cb.c, emulated_eeprom.c, eeprom_interface.c}` | ✅ 完成，已入 `FOC_SRC` |
+| 应用层 | `UserApp/app_foc.{h,c}` + `configurations.h` | ✅ 完成，已入 `FOC_SRC` |
+| CAN 协议 | `UserApp/protocols/interface_can.c` | ⬜ 第二阶段 |
+
+### 阶段 C 已完成项
+
+| 项目 | 位置 |
+|---|---|
+| `MX_*_Init` 调用顺序（含 ADC/CAN/SPI1/TIM2/TIM4） | `Core/Src/rt_board.c` |
+| `TIM4_IRQHandler` → `foc_tick_20khz(); return;` | `Core/Src/stm32f1xx_it.c` 的 USER CODE 段 |
+| `main()` → `foc_app_init()` | `Core/Src/main.c` 的 USER CODE 段 |
+| 100 Hz 家务线程（按键 / LED / 校准主循环 / CONFIG_COMMIT） | `FOC/UserApp/app_foc.c` |
+| msh 命令 `foc_status/foc_cali/foc_mode/foc_pos/foc_vel/foc_cur/foc_enable/foc_disable/foc_brake/foc_home/foc_save` | `FOC/UserApp/app_foc.c` |
+| 上板调试命令 `foc_enc`（MT6816 SPI 探针） / `foc_ctrl on\|off`（手动启停 20 kHz） | `FOC/UserApp/app_foc.c` |
+| `FOC_AUTOSTART_20KHZ` 开关（首刷排障用，默认 1） | `FOC/UserApp/app_foc.c` |
+
+### Flash 写入保护
+
+写 Flash 会暂停 CPU 的 Flash 取指 20~40 ms，期间 20 kHz 中断被推迟，
+PWM 保持最后比较值 → 电机以旧力矩继续推。因此三个命令都加了停机检查：
+
+| 命令 | 保护条件 |
+|---|---|
+| `foc_cali` | `mode_running == MOTOR_MODE_STOP`（校准会强行推电机转两圈） |
+| `foc_home` | `foc_flash_write_allowed()`：`mode_running == STOP` 或 `soft_disable` |
+| `foc_save` | 同上 |
+
+不满足时打印 `refuse <cmd>: motor is active (mode=...)` 并提示先
+`foc_mode stop` 或 `foc_disable`。
+
+### 已知风险（需上硬件验证）
+
+1. **MT6816 缺失/损坏会锁死系统**：`mt6816_stm32_spi_transmit_and_read16()` 用
+   `HAL_SPI_TransmitReceive(..., HAL_MAX_DELAY)`，在 TIM4（优先级 0）中断里执行。
+   若 SPI 一直不返回，HAL 的 `HAL_GetTick()` 超时判断也无法推进（TIM1 时基优先级 15，
+   抢不到 CPU），20 kHz 中断将永久挂死。上游同样如此，硬件一致时可用；
+   若要加固，应在 `HAL_SPI_TransmitReceive` 外层加寄存器级超时计数。
+2. **`foc_tick_20khz()` 未调用 `rt_interrupt_enter/leave`**：这是刻意的，
+   因为该路径不调用任何 RT-Thread API。若将来要在其中加 `rt_kprintf` 等调用，
+   必须补上这两个钩子。
+3. **Flash 擦写阻塞**：`encoder_calibrator_tick_main_loop()` 在 100 Hz 线程里
+   擦写 32 KB，期间 CPU 阻塞数十毫秒；已在设计上限定只在 `CALI_STATE_CALCULATING`
+   且电机休眠时执行。
+
+> 已转换的模块现已被 `app_foc.c` 调用，`--gc-sections` 不再丢弃，体积已体现在镜像中。
 
 ---
 

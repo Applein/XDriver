@@ -42,6 +42,36 @@ set(FOC_SRC
     # --- 阶段 B: 信号层 Port (依赖 CubeMX 引脚标签, 阶段 D 后启用) ---
     ${FOC_DIR}/Port/button_stm32.c   # BUTTON1_Pin / BUTTON2_Pin
     ${FOC_DIR}/Port/led_stm32.c      # LED1_Pin / LED2_Pin
+
+    # --- 阶段 B: 驱动层 ---
+    ${FOC_DIR}/Ctrl/Driver/sin_map.c        # 正弦表 (从 sin_map.h 拆出)
+    ${FOC_DIR}/Ctrl/Driver/tb67h450_base.c  # FOC 电流矢量 -> 两相 DAC
+    ${FOC_DIR}/Port/tb67h450_stm32.c        # TB67H450PortOps 板级实现
+
+    # --- 阶段 B: 编码器层 ---
+    ${FOC_DIR}/Ctrl/Sensor/Encoder/mt6816_base.c  # 14bit 角度 + 校验 + 查表
+    ${FOC_DIR}/Port/mt6816_stm32.c                # MT6816PortOps (SPI1 + PA15)
+
+    # --- 阶段 B: 运动规划器 ---
+    ${FOC_DIR}/Ctrl/Motor/motion_planner.c        # 5 个 tracker (电流/速度/位置/插补/轨迹)
+
+    # --- 阶段 B: 电机闭环 ---
+    ${FOC_DIR}/Ctrl/Motor/motor.c                 # Motor + MotionController (20 kHz 主逻辑)
+
+    # --- 阶段 B: 编码器校准 ---
+    ${FOC_DIR}/Ctrl/Sensor/Encoder/encoder_calibrator_base.c
+    ${FOC_DIR}/Port/encoder_calibrator_stm32.c    # CaliFlashOps -> stockpile_quick_cali
+
+    # --- 存储层 (校准表 + 配置页) ---
+    ${FOC_DIR}/Port/Platform/Memory/stockpile_f103cb.c
+    ${FOC_DIR}/Port/Platform/Memory/emulated_eeprom.c    # 最后一页 1KB 缓冲 + 擦写
+    ${FOC_DIR}/Port/Platform/Memory/eeprom_interface.c   # eeprom_get_blob / put_blob
+
+    # --- 板级工具 ---
+    ${FOC_DIR}/Port/Platform/Utils/st_hardware.c         # GetSerialNumber()
+
+    # --- 应用层 ---
+    ${FOC_DIR}/UserApp/app_foc.c                         # 全局对象 / 20kHz 入口 / 100Hz 线程
 )
 
 # ---------------------------------------------------------------------------

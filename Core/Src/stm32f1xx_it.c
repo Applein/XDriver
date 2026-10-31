@@ -25,6 +25,7 @@
 #include <rthw.h>
 #include <rtthread.h>
 #include "rt_board.h"
+#include "app_foc.h"        /* foc_tick_20khz() */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -88,8 +89,10 @@ void NMI_Handler(void)
   /* USER CODE END NonMaskableInt_IRQn 1 */
 }
 
-/* HardFault_Handler is provided by RT-Thread
- * (RT-Thread/libcpu/arm/cortex-m3/context_gcc.S) and prints the fault
+/* HardFault_Handler is provided by RT-Thread
+
+ * (RT-Thread/libcpu/arm/cortex-m3/context_gcc.S) and prints the fault
+
  * registers through the console. Defining it here causes a duplicate symbol. */
 /**
   * @brief This function handles Memory management fault.
@@ -162,8 +165,10 @@ void DebugMon_Handler(void)
   /* USER CODE END DebugMonitor_IRQn 1 */
 }
 
-/* PendSV_Handler is provided by RT-Thread
- * (RT-Thread/libcpu/arm/cortex-m3/context_gcc.S) and performs the thread
+/* PendSV_Handler is provided by RT-Thread
+
+ * (RT-Thread/libcpu/arm/cortex-m3/context_gcc.S) and performs the thread
+
  * context switch. Defining it here would break the scheduler. */
 /**
   * @brief This function handles System tick timer.
@@ -306,7 +311,11 @@ void TIM1_UP_IRQHandler(void)
 void TIM4_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM4_IRQn 0 */
-
+    /* 20 kHz FOC 闭环: 直接调用应用层, 跳过 HAL_TIM_IRQHandler 以降低开销。
+       foc_tick_20khz() 内部会自行清除 TIM_IT_UPDATE 标志。
+       注意: 这里不得调用任何 RT-Thread API。 */
+    foc_tick_20khz();
+    return;
   /* USER CODE END TIM4_IRQn 0 */
   HAL_TIM_IRQHandler(&htim4);
   /* USER CODE BEGIN TIM4_IRQn 1 */

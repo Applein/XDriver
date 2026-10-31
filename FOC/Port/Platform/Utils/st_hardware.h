@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-uint64_t GetSerialNumber();
+uint64_t GetSerialNumber(void);
 
 #ifdef __cplusplus
 }

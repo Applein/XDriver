@@ -65,6 +65,7 @@ void Stockpile_Flash_Data_Begin(Stockpile_FLASH_Typedef *stockpile)
 **/
 void Stockpile_Flash_Data_End(Stockpile_FLASH_Typedef *stockpile)
 {
+	(void)stockpile;	/* 上游未使用该参数, 显式置空以消除 -Wunused-parameter */
 	HAL_FLASH_Lock();	//LL_FLASH_Lock();
 }
 
