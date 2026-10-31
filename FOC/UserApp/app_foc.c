@@ -171,9 +171,18 @@ static void board_config_set_defaults(uint16_t node_id)
     boardConfig.velocity_limit = 30 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS; /* r/s */
     boardConfig.velocity_acc = 100 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;  /* r/s^2 */
     boardConfig.calibration_current = 2000;
-    boardConfig.dce_kp = 200;
+
+    /*
+     * 位置环默认增益: 500/80/5/250
+     *
+     * 与上游 (200/80/300/250) 不同 —— ki=300 在 20 kHz 下会让积分
+     * 0.2 秒内冲到限幅, 造成到位后持续振荡。详见 motor.c 里的注释。
+     * 必须与 motor.c 的 MOTOR_CONFIG_DEFAULT 保持一致, 否则首次上电
+     * (Flash 为空) 与后续启动 (读 Flash) 会得到不同手感。
+     */
+    boardConfig.dce_kp = 500;
     boardConfig.dce_kv = 80;
-    boardConfig.dce_ki = 300;
+    boardConfig.dce_ki = 5;
     boardConfig.dce_kd = 250;
     boardConfig.enable_motor_on_boot = false;
     boardConfig.enable_stall_protect = false;
@@ -664,8 +673,29 @@ static void foc_cmd_status(int argc, char **argv)
     }
 
     rt_kprintf("pos     : %d (mrev)\n", pos_mrev);
-    rt_kprintf("vel     : %d (mrev/s)\n", vel_mrps);
+    rt_kprintf("vel     : %d (mrps)\n", vel_mrps);
     rt_kprintf("current : %d (mA)\n", c->foc_current);
+
+    /*
+     * 控制器内部量 (单位: 1/51200 圈) —— 用于诊断"到位后抖动"。
+     *
+     * 判读: 稳定保持时 tgt==est 且 err 只有 ±1~2 的编码器量化噪声。
+     *   - est 在 tgt 两侧来回跳, err 正负交替, out 跟着正负翻
+     *       => 位置环形成极限环 (欠阻尼/增益不当), 需要调 gain
+     *   - out 长期为 0 但电机动
+     *       => 保持力矩太小 (kp 太小), 转子被齿槽转矩带着走
+     *   - est 出现单次大跳变 (几十 counts) 后又回来
+     *       => 编码器校准表在该 raw angle 上有断点
+     * ki 是积分项 (放大 1024 倍), out 是最终电流 (mA, 已限幅)。
+     */
+    rt_kprintf("ctrl    : tgt=%d est=%d err=%d\n",
+               (int)c->goal_position, (int)c->est_position,
+               (int)c->config->dce.p_error);
+    rt_kprintf("dce     : ki=%d out=%d (kp=%d kv=%d ki=%d kd=%d)\n",
+               (int)(c->config->dce.output_ki >> 10), (int)c->config->dce.output,
+               (int)c->config->dce.kp, (int)c->config->dce.kv,
+               (int)c->config->dce.ki, (int)c->config->dce.kd);
+
     rt_kprintf("calib   : %s\n", calibrated ? "yes" : "NO");
     rt_kprintf("stall   : %d, overload %d\n", (int)c->is_stalled, (int)c->overload_flag);
     rt_kprintf("cfg     : node=%u limit=%dmA vel=%d acc=%d\n",
@@ -708,6 +738,313 @@ static void foc_cmd_status(int argc, char **argv)
     rt_kprintf("uart    : ore=%lu err=%lu  (rx lost if growing)\n",
                (unsigned long)console_err_ore,
                (unsigned long)console_err_other);
+}
+
+/*
+ * jit —— 量化"到位后抖动"
+ *
+ * 用法: xdrv jit [ms]      默认 500ms, 上限 5000ms
+ *
+ * 在指定时间窗内连续采样 real_position 与 est_velocity, 输出:
+ *   span  : 位置峰峰值 (counts, 1 圈 = 51200)
+ *   vpp   : 速度峰峰值 (steps/s)
+ *   flip  : 位置变化方向翻转次数
+ *
+ * 判读:
+ *   span <= 3 且 flip 很小        -> 稳定, 抖动只是编码器量化噪声
+ *   span 几十~几百且 flip 很多     -> 极限环振荡, 调 xdrv gain
+ *   span 极大且 vpp 极大           -> 有单次跳变, 怀疑校准表断点
+ *
+ * 注意: 本命令在采样循环里空转 (不 delay), 会把 shell 线程占满,
+ *       仅用于诊断, 不要长时间运行。
+ */
+/*
+ * jit —— 量化"到位后抖动"
+ *
+ * 用法: xdrv jit [ms]      默认 500ms, 上限 5000ms
+ *
+ * 输出三个峰峰值, 各自回答不同问题:
+ *   span  : 位置峰峰值 (counts, 1 圈 = 51200)  —— 轴到底动没动
+ *   vspan : 速度峰峰值 (steps/s)               —— 用窗口差分算, 不受量化噪声
+ *   ispan : 电流峰峰值 (mA)                    —— 线圈是否在持续通断
+ *
+ * 速度算法说明 (重要):
+ *   早期版本直接用 est_velocity 求峰峰值, 结果静止时也能报出 3000+ steps/s,
+ *   完全是假象: 静止时 delta_position 只有 0/±1, 乘 20000 再经 1/32 低通,
+ *   就是几百 steps/s 的噪声。est_velocity 在低速/静止区不可信。
+ *   现在改为对 real_position 做 WINDOW_MS 窗口差分再换算成 steps/s,
+ *   1 count 的量化误差被窗口长度摊薄, 静止时读数接近 0。
+ *
+ * 判读 (三者结合):
+ *   span<=3, ispan 小           -> 真正静止
+ *   span<=3, ispan 大 (几百mA)  -> 位置不动但电流来回翻 = 换相角在跳, 见
+ *                                  motor.c 里 FOC_CURRENT_SIGN_HYST_MA 的说明
+ *   span 大, vspan 大, flips 多 -> 极限环振荡, 调 xdrv gain
+ *   span 极大, vspan 极大       -> 单次跳变, 怀疑校准表断点
+ *
+ * 注意: 采样循环里空转 (不 delay), 会占满 shell 线程, 仅用于诊断。
+ */
+/*
+ * 速度窗口长度 (ms)
+ *
+ * 这是量化噪声与时间分辨率之间的折中:
+ *   - 窗口越短, 越能反映快速变化, 但 1 count 的量化误差放大越严重
+ *   - 窗口越长, 噪声越小, 但会抹掉真实的快速抖动
+ *
+ * 取 20ms 的理由: 1 count 跳变在 20ms 窗口下只是 50 steps/s,
+ * 而在 2ms 窗口下会被放大成 500 steps/s(相差 10 倍)。实测 2ms 时
+ * 静止状态会报出 3000 steps/s 的假峰峰值, 与实际位移完全不符。
+ *
+ * 判读参考 (静止保持时):
+ *   vspan < 200 steps/s  正常 (编码器量化 + 微小真实抖动)
+ *   vspan 数百以上       真实运动, 结合 span 判断是振荡还是漂移
+ */
+#define FOC_JIT_WINDOW_MS               20      /* 速度差分窗口 */
+
+static void foc_cmd_jit(int argc, char **argv)
+{
+    int32_t duration_ms = 500;
+    int32_t min_pos;
+    int32_t max_pos;
+    int32_t min_cur;
+    int32_t max_cur;
+    int32_t min_vel = 0;
+    int32_t max_vel = 0;
+    int32_t prev_pos;
+    int32_t win_pos;                    /* 窗口起点位置 */
+    rt_tick_t win_t0;                   /* 窗口起点时刻 */
+    int32_t prev_dir = 0;
+    uint32_t flips = 0;
+    uint32_t samples = 0;
+    uint32_t vel_samples = 0;
+    rt_tick_t t0;
+
+    if (argc >= 2)
+    {
+        duration_ms = (int32_t)atoi(argv[1]);
+        if (duration_ms <= 0)
+        {
+            duration_ms = 500;
+        }
+        if (duration_ms > 5000)
+        {
+            duration_ms = 5000;
+        }
+    }
+
+    if ((motor.controller->mode_running != MOTOR_MODE_COMMAND_POSITION) ||
+        (motor.controller->state != MOTOR_STATE_FINISH))
+    {
+        rt_kprintf("note: motor is not holding a position (mode=%s state=%s)\n",
+                   foc_mode_name(motor.controller->mode_running),
+                   foc_state_name(motor.controller->state));
+        rt_kprintf("      run 'xdrv pos <mrev>' and wait for FINISH first\n");
+    }
+
+    min_pos = motor.controller->real_position;
+    max_pos = min_pos;
+    prev_pos = min_pos;
+    win_pos = min_pos;
+    min_cur = motor.controller->foc_current;
+    max_cur = min_cur;
+
+    t0 = rt_tick_get();
+    win_t0 = t0;
+    while ((rt_tick_get() - t0) < (rt_tick_t)rt_tick_from_millisecond(duration_ms))
+    {
+        int32_t pos = motor.controller->real_position;
+        int32_t cur = motor.controller->foc_current;
+        int32_t step = pos - prev_pos;
+        int32_t dir = (step > 0) ? 1 : ((step < 0) ? -1 : 0);
+
+        if (pos < min_pos) { min_pos = pos; }
+        if (pos > max_pos) { max_pos = pos; }
+        if (cur < min_cur) { min_cur = cur; }
+        if (cur > max_cur) { max_cur = cur; }
+
+        /* 方向真正反转才计数 (静止的 0 不算, 避免噪声放大) */
+        if ((dir != 0) && (prev_dir != 0) && (dir != prev_dir))
+        {
+            flips++;
+        }
+        if (dir != 0)
+        {
+            prev_dir = dir;
+        }
+
+        /*
+         * 每 FOC_JIT_WINDOW_MS 采一个速度样本:
+         *   v = delta_position / window_time
+         * 窗口内的 1 count 量化误差被摊薄, 静止时结果接近 0。
+         *
+         * 注意: 这是空转循环, 迭代速度远超 20 kHz, 所以窗口必须按
+         * 真实时间 (rt_tick) 判定, 不能数迭代次数。
+         */
+        if ((rt_tick_get() - win_t0) >= (rt_tick_t)rt_tick_from_millisecond(FOC_JIT_WINDOW_MS))
+        {
+            int32_t v = (int32_t)(((int64_t)(pos - win_pos) * 1000) /
+                                  (int64_t)FOC_JIT_WINDOW_MS);
+
+            if (v < min_vel) { min_vel = v; }
+            if (v > max_vel) { max_vel = v; }
+
+            win_pos = pos;
+            win_t0 = rt_tick_get();
+            vel_samples++;
+        }
+
+        prev_pos = pos;
+        samples++;
+    }
+
+    rt_kprintf("jit     : span=%d cnt (%d.%03d mrev)\n",
+               (int)(max_pos - min_pos),
+               (int)((max_pos - min_pos) / 51),
+               (int)(((max_pos - min_pos) % 51) * 1000 / 51));
+    rt_kprintf("        : vspan=%d steps/s (over %d ms windows, n=%lu)\n",
+               (int)(max_vel - min_vel), FOC_JIT_WINDOW_MS,
+               (unsigned long)vel_samples);
+    rt_kprintf("        : ispan=%d mA, flips=%lu, samples=%lu in %d ms\n",
+               (int)(max_cur - min_cur), (unsigned long)flips,
+               (unsigned long)samples, (int)duration_ms);
+
+    /*
+     * vspan 的合理性上限由 span 推导, 而不是用绝对值阈值。
+     *
+     * 推导: vspan 是峰峰值 (max-min)。位置若在 span 内来回, 一个窗口正向
+     * 跳 span 得 +span/w, 下一个窗口反向跳 span 得 -span/w, 于是
+     *     vspan ≈ 2 * span / window
+     * 取 span=3, window=20ms => 2*3/0.02 = 300 steps/s。
+     *
+     * 所以 span=3 配 vspan=300 是【正常】的, 早期用固定阈值 200 会误报。
+     * 这里把允许上限设为理论值的 1.6 倍 (容纳窗口边界错位), 只要不超过它,
+     * 就说明 vspan 完全由这 span 个 count 的抖动解释, 没有额外的位移。
+     */
+    {
+        int32_t span_cnt = max_pos - min_pos;
+        int32_t vspan_pp = max_vel - min_vel;
+        int32_t vlimit = ((span_cnt + 1) * 2000) / FOC_JIT_WINDOW_MS;
+
+        if (span_cnt <= 3)
+        {
+            if ((max_cur - min_cur) > 60)
+            {
+                rt_kprintf("        : position stable BUT current churning ->\n");
+                rt_kprintf("          commutation sign is flipping (raise hyst or check gain)\n");
+            }
+            else if (vspan_pp > vlimit)
+            {
+                /* 排除量化噪声后仍有大速度 => 真正的单次跳变 */
+                rt_kprintf("        : position quiet but vspan %d > %d expected\n",
+                           (int)vspan_pp, (int)vlimit);
+                rt_kprintf("          single jumps beyond quantisation ->\n");
+                rt_kprintf("          if this repeats, suspect calibration table defects\n");
+            }
+            else
+            {
+                /* 到这里说明 vspan 完全由 span 个 count 的抖动解释 */
+                rt_kprintf("        : stable (span explains vspan; %d <= %d)\n",
+                           (int)vspan_pp, (int)vlimit);
+            }
+        }
+        else if (flips > (samples / 20U))
+        {
+            rt_kprintf("        : oscillating -> try 'xdrv gain' to retune\n");
+        }
+        else
+        {
+            rt_kprintf("        : jumperry / possible calibration table defect\n");
+        }
+    }
+}
+
+/*
+ * gain —— 在线读写位置环 (DCE) 增益
+ *
+ * 用法:
+ *   xdrv gain                     查看当前值
+ *   xdrv gain <kp> <kv> <ki> <kd> 设置 (立即生效, 不写 Flash)
+ *
+ * 改完确认手感正常后, 用 xdrv save 持久化 (需先 off)。
+ *
+ * 各参数含义 (与上游一致, 均为定点整数):
+ *   kp  位置误差 -> 电流, 输出贡献 = kp * p_error / 1024  mA
+ *   kv  速度误差 -> 积分项 (抑制稳态误差)
+ *   ki  位置误差 -> 积分项 (消除长期偏差, 太大会振荡)
+ *   kd  速度误差 -> 阻尼项 (抑制振荡, 抖就加大它)
+ */
+static void foc_cmd_gain(int argc, char **argv)
+{
+    ControllerDce *dce = &motor.config.ctrl_params.dce;
+
+    if (argc == 1)
+    {
+        rt_kprintf("gain    : kp=%d kv=%d ki=%d kd=%d\n",
+                   (int)dce->kp, (int)dce->kv, (int)dce->ki, (int)dce->kd);
+        rt_kprintf("          'xdrv gain <kp> <kv> <ki> <kd>' to change,\n");
+        rt_kprintf("          then 'xdrv save' to persist (needs 'off' first)\n");
+        return;
+    }
+
+    if (argc != 5)
+    {
+        rt_kprintf("usage: " FOC_CMD_NAME " gain [<kp> <kv> <ki> <kd>]\n");
+        return;
+    }
+
+    FOC_CMD_ENTER_CRITICAL();
+    dce->kp = (int32_t)atoi(argv[1]);
+    dce->kv = (int32_t)atoi(argv[2]);
+    dce->ki = (int32_t)atoi(argv[3]);
+    dce->kd = (int32_t)atoi(argv[4]);
+
+    /* 同步到配置结构, 这样 'xdrv save' 能把它写进 Flash */
+    boardConfig.dce_kp = dce->kp;
+    boardConfig.dce_kv = dce->kv;
+    boardConfig.dce_ki = dce->ki;
+    boardConfig.dce_kd = dce->kd;
+    FOC_CMD_EXIT_CRITICAL();
+
+    rt_kprintf("gain    : kp=%d kv=%d ki=%d kd=%d (run 'xdrv save' to keep)\n",
+               (int)dce->kp, (int)dce->kv, (int)dce->ki, (int)dce->kd);
+}
+
+/*
+ * restore —— 恢复出厂默认配置
+ *
+ * 为什么不能复用 CONFIG_RESTORE:
+ *   那个状态的含义是"把当前 boardConfig 写回 Flash 然后复位",
+ *   写回去的还是当前值, 起不到恢复默认的作用。
+ *
+ * 这里改为: 先把 can_node_id 留下来 (它是硬件身份, 不该丢),
+ * 其余字段重写成出厂默认 → 写 Flash → 复位。
+ *
+ * 同样要求电机停机 (会擦写 Flash)。
+ */
+static void foc_cmd_restore(int argc, char **argv)
+{
+    uint16_t keep_node_id;
+
+    (void)argc;
+    (void)argv;
+
+    if (!foc_flash_write_allowed("restore"))
+    {
+        return;
+    }
+
+    keep_node_id = (uint16_t)boardConfig.can_node_id;
+
+    /* 启动阶段用过的同一个默认值函数, 避免两处写不同数字 */
+    board_config_set_defaults(keep_node_id);
+
+    eeprom_put_blob(0, &boardConfig, (uint16_t)sizeof(boardConfig));
+
+    rt_kprintf("config restored to defaults (node=%u), rebooting...\n",
+               (unsigned)keep_node_id);
+
+    rt_thread_mdelay(50);           /* 让串口把上面这句发完 */
+    HAL_NVIC_SystemReset();
 }
 
 static void foc_cmd_cali(int argc, char **argv)
@@ -985,6 +1322,9 @@ static void foc_cli_usage(void)
     rt_kprintf("  off                      release the shaft (no torque)\n");
     rt_kprintf("  brake                    short the coils (stiff, no current)\n");
     rt_kprintf("  cali | home | save       calibrate / zero / flash [need 'off']\n");
+    rt_kprintf("  restore                  factory defaults + reboot [need 'off']\n");
+    rt_kprintf("  jit [ms]                 measure holding jitter (default 500ms)\n");
+    rt_kprintf("  gain [kp kv ki kd]       show / retune position loop gains\n");
     rt_kprintf("  enc  | loop <on|off>     SPI probe / 20kHz control loop\n");
     rt_kprintf("\n");
     rt_kprintf("  no calibration -> no torque; run 'cali' with a free shaft\n");
@@ -1015,6 +1355,14 @@ static void foc_cmd_xdrv(int argc, char **argv)
     else if (rt_strcmp(sub, "cali") == 0)
     {
         foc_cmd_cali(argc, argv);
+    }
+    else if (rt_strcmp(sub, "jit") == 0)
+    {
+        foc_cmd_jit(argc, argv);
+    }
+    else if (rt_strcmp(sub, "gain") == 0)
+    {
+        foc_cmd_gain(argc, argv);
     }
     else if (rt_strcmp(sub, "pos") == 0)
     {
@@ -1047,6 +1395,10 @@ static void foc_cmd_xdrv(int argc, char **argv)
     else if (rt_strcmp(sub, "save") == 0)
     {
         foc_cmd_save(argc, argv);
+    }
+    else if (rt_strcmp(sub, "restore") == 0)
+    {
+        foc_cmd_restore(argc, argv);
     }
     else if (rt_strcmp(sub, "enc") == 0)
     {

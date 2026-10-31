@@ -23,6 +23,22 @@
 
 #include "configurations.h"     /* boardConfig (motion_ctrl_init 读取) */
 
+/*
+ * 换相角符号的滞回阈值 (mA)
+ *
+ * 只有 |电流| 超过它才允许改变超前/滞后方向, 零附近沿用上一次方向。
+ * 目的见 motion_ctrl_calc_current_to_output() 的注释。
+ *
+ * 取值考虑:
+ *   - 太小 (如 2mA): 仍会被量化噪声穿透, 起不到作用
+ *   - 太大 (如 200mA): 真实的微小指令 (cur 10) 会被误判为"不出力"
+ * 15mA 约为额定 1000mA 的 1.5%, 远高于噪声, 又低于任何有意义的指令。
+ */
+enum
+{
+    FOC_CURRENT_SIGN_HYST_MA = 15,
+};
+
 /* ========================================================================== */
 /* Controller: 私有方法                                                        */
 /* ========================================================================== */
@@ -108,13 +124,42 @@ static void motion_ctrl_attach_config(MotionController *self, ControllerConfig *
 /* 上游: void Motor::Controller::CalcCurrentToOutput(int32_t current) */
 static void motion_ctrl_calc_current_to_output(MotionController *self, int32_t current)
 {
+    /*
+     * 换相角符号的滞回 (本工程在上游基础上的唯一控制逻辑改动)
+     *
+     * 上游直接按 foc_current 的正负决定超前/滞后 90°:
+     *     current > 0 -> est_position + SOFT_DIVIDE_NUM
+     *     current < 0 -> est_position - SOFT_DIVIDE_NUM
+     * 而 SOFT_DIVIDE_NUM=256 是一圈的 1/4, 即 90° 电角度, 两侧相差 180°。
+     *
+     * 位置环稳定时 p_error 只剩 ±1~2 counts 的量化噪声, 输出电流在 0 附近
+     * 正负跳变, 于是换相角每个 tick 就跳 512 counts。结果是力矩矢量在高频
+     * 左右翻 180°: 转子不产生净位移, 却持续受到交变力矩 —— 表现为
+     * "电机轴不转, 但用手能摸到震动", 并且线圈会发热、可能发出啸叫。
+     *
+     * 加滞回后, 只有电流明确超过阈值才换向; 零附近的抖动一律沿用上一次
+     * 的方向。真实指令 (cur 200 / pos 阶跃) 远大于阈值, 行为与上游一致。
+     */
+    if (current > FOC_CURRENT_SIGN_HYST_MA)
+    {
+        self->foc_sign = 1;
+    }
+    else if (current < -FOC_CURRENT_SIGN_HYST_MA)
+    {
+        self->foc_sign = -1;
+    }
+    else
+    {
+        /* 保持上一次方向; 若从未出力过则 foc_sign 仍为 0, 走下面的零分支 */
+    }
+
     self->foc_current = current;
 
-    if (self->foc_current > 0)
+    if (self->foc_sign > 0)
     {
         self->foc_position = self->est_position + SOFT_DIVIDE_NUM;  /* 超前 90° */
     }
-    else if (self->foc_current < 0)
+    else if (self->foc_sign < 0)
     {
         self->foc_position = self->est_position - SOFT_DIVIDE_NUM;  /* 滞后 90° */
     }
@@ -268,6 +313,7 @@ void motion_ctrl_init(MotionController *self)
     self->soft_new_curve = false;
 
     self->foc_position = 0;
+    self->foc_sign = 0;
     self->foc_current = 0;
 
     self->stalled_time = 0;
@@ -519,6 +565,7 @@ static void motor_close_loop_control_tick(Motor *self)
     {
         motion_ctrl_clear_integral(controller);
         controller->foc_position = 0;
+        controller->foc_sign = 0;
         controller->foc_current = 0;
         driver_sleep(self->driver);
     }
@@ -526,6 +573,7 @@ static void motor_close_loop_control_tick(Motor *self)
     {
         motion_ctrl_clear_integral(controller);
         controller->foc_position = 0;
+        controller->foc_sign = 0;
         controller->foc_current = 0;
         driver_brake(self->driver);
     }
@@ -905,9 +953,21 @@ void motor_init(Motor *self)
             },
             .dce =
             {
-                .kp = 200,
+                /*
+                 * 与上游不同: 上游默认 200/80/300/250。
+                 *
+                 * ki=300 在 20 kHz 下积分过快: 每 tick 累加 300*p_error,
+                 * 0.2 秒就能冲到 +/-rated_current 限幅, 于是积分在目标点
+                 * 两侧来回充放电, 位置环持续振荡。kd=250 的阻尼又只有
+                 * 0.0019 mA/(count/s), 几乎起不到抑制作用。
+                 *
+                 * 实测 500/80/5/250 在 XDriver 硬件上到位后无抖动,
+                 * 所以把它作为默认值。若换电机/负载, 用 xdrv gain 重新整定,
+                 * 确认后 xdrv save 写进 Flash (此时 Flash 里的值优先)。
+                 */
+                .kp = 500,
                 .kv = 80,
-                .ki = 300,
+                .ki = 5,
                 .kd = 250,
             },
             .stall_protect_switch = false,

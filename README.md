@@ -128,7 +128,10 @@ VS Code 任务（`Ctrl+Shift+P` → `Tasks: Run Task`）：
 | `xdrv brake` | 短路两相线圈，轴变硬（无电流制动） |
 | `xdrv home` | 把当前位置设为零点（要求先 `off`） |
 | `xdrv save` | 保存配置到 Flash（要求先 `off`） |
+| `xdrv restore` | 恢复出厂默认配置并重启（要求先 `off`） |
 | `xdrv enc` | MT6816 SPI 通路探测 |
+| `xdrv jit [ms]` | 量化保持时的拖动量（默认 500 ms） |
+| `xdrv gain [kp kv ki kd]` | 查看／在线调整位置环（DCE）增益 |
 | `xdrv loop <on\|off>` | 手动启停 20 kHz 闭环 |
 
 ### 首次使用流程
@@ -182,6 +185,94 @@ msh > xdrv cur 300         # 300 mA 力矩
 
 若 `spi_fail` 中出现 `sr=0x0000` 且 `rxne` 增长，说明 SPI 外设曾完全停摆
 （OVR/MODF 锁死），固件会在超时后自动复位 SPI 恢复。
+
+### `ctrl` / `dce` 两行（控制器内部量）
+
+单位都是 **1/51200 圈**（`tgt`/`est`/`err`）。判读方式：
+
+| 现象 | 结论 |
+|---|---|
+| `err` 只有 ±1~2 | 正常，编码器量化噪声 |
+| `est` 在 `tgt` 两侧来回跳、`out` 正负翻转 | **极限环振荡**（位置环欠阻尼）→ 调 `gain` |
+| `out` 长期为 0 但轴会动 | 保持力矩不足（`kp` 太小），转子被齿槽转矩带着走 |
+| `est` 出现几十 counts 的单次跳变 | 怀疑编码器校准表在该 raw angle 有断点 |
+
+### 与上游的唯一控制逻辑差异：换相角滞回
+
+上游 `CalcCurrentToOutput()` 直接按电流正负决定超前/滞后 90°：
+
+```c
+if (current > 0) foc_position = est_position + 256;   // 超前
+else             foc_position = est_position - 256;   // 滞后
+```
+
+`SOFT_DIVIDE_NUM = 256` 是一圈的 1/4，所以两侧相差 **180° 电角度**。
+位置环稳定时 `p_error` 只剩 ±1~2 counts 噪声，输出在 0 附近正负跳变，
+换相角就每个 tick 跳 512 counts —— 力矩矢量高频翻 180°，
+**转子不产生净位移，却持续受到交变力矩**：表现为「轴不转，但手能摸到震动」。
+
+本工程加了 15 mA 滞回（`FOC_CURRENT_SIGN_HYST_MA`），只有电流明确超过
+阈值才换向，零附近沿用上次方向。真实指令（`cur 200`、位置阶跃）远大于
+阈值，行为与上游一致。
+
+### 到位后抽动（jitter）
+
+先量化，再决定改什么：
+
+```
+msh > xdrv pos 1777          # 等待 state: FINISH
+msh > xdrv jit 2000          # 采样 2 秒
+jit     : span=3 cnt (0.058 mrev)
+        : vspan=150 steps/s (over 20 ms windows, n=100)
+        : ispan=8 mA, flips=125, samples=236627 in 2000 ms
+        : stable (position and current both quiet)
+```
+
+三个峰峰值各自回答一个问题：
+
+| 指标 | 含义 | 正常值 |
+|---|---|---|
+| `span` | 位置峰峰值（counts，1 圈 = 51200） | ≤ 3 |
+| `vspan` | 速度峰峰值（steps/s，**20 ms 窗口差分**） | 与 `span` 自洽即可 |
+| `ispan` | 电流峰峰值（mA） | 几十以内 |
+
+> **`vspan` 的合理上限由 `span` 推导，没有绝对阈值。**
+> 因为 `vspan` 是峰峰值（max−min）：位置在 `span` 内来回时，
+> 一个窗口正向跳得 `+span/w`，下一个窗口反向跳得 `−span/w`，
+> 所以 `vspan ≈ 2 × span / w`。例如 `span=3`、`w=20 ms` → **300 steps/s 是正常的**，
+> 它不是“额外抖动”，而就是这 3 个 count 换算成速度后的必然结果。
+> 只有当 `vspan` 明显超过 `2 × span / w` 时，才说明有超出量化的单次跳变。
+
+> **`vspan` 是用 `real_position` 的 20 ms 窗口差分算的**，不是 `est_velocity`。
+> 两个教训：
+> 1. `est_velocity` 在静止时不可信 —— `delta_position` 只有 `0/±1`，
+>    乘 20000 再经 1/32 低通，会报出 3000+ steps/s 的假象
+> 2. 窗口不能太短 —— 2 ms 窗口下 1 count 跳变就是 500 steps/s，
+>    同样会造出假峰峰值；20 ms 把它压到 50 steps/s
+
+| 结果 | 含义 | 处理 |
+|---|---|---|
+| `span ≤ 3` 且 `ispan` 小 | 真正静止 | 不用管 |
+| `span ≤ 3` 但 `ispan` 几百 mA | 位置不动、电流来回翻 → 换相角在跳 | 见下方「换相角滞回」 |
+| `span` 几十~几百 + `flips` 多 | 极限环 | 调小 `ki`、加大 `kd` |
+| `span` 极大 + `vspan` 极大 | 疑似校准表断点 | 重新 `xdrv cali` |
+
+调参示例（立即生效，确认后 `xdrv save` 持久化）：
+
+```
+msh > xdrv gain                     # 看当前值
+msh > xdrv gain 500 80 5 250        # kp kv ki kd
+msh > xdrv jit 2000                 # 再测一次
+msh > xdrv off
+msh > xdrv save
+```
+
+> **出厂默认值已改为 `500 / 80 / 5 / 250`**（上游是 `200 / 80 / 300 / 250`）。
+> 上游的 `ki=300` 在 20 kHz 下让积分 0.2 秒就冲到限幅，到位后持续振荡；
+> `kd=250` 的阻尼又只有 0.0019 mA/(count/s)，几乎不起抑制作用。
+> 注意 `xdrv gain` 不带参数显示的是**当前生效值** —— 它来自 Flash 里保存的
+> 配置，不一定等于出厂默认。调好后执行 `xdrv save` 让改动永久生效；
+> 想丢弃 Flash 配置回到出厂值，用 `xdrv restore`（会保留板子的 node id）。
 
 ---
 

@@ -124,6 +124,7 @@ typedef struct
     bool soft_brake;
     bool soft_new_curve;
     int32_t foc_position;
+    int32_t foc_sign;       /* 换相角符号的滞回状态: -1 / 0 / +1, 见 calc_current_to_output */
     uint32_t stalled_time;
     uint32_t overload_time;
     bool overload_flag;
