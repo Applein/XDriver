@@ -40,6 +40,9 @@ add_subdirectory(cmake/stm32cubemx)
 # Add RT-Thread kernel + FinSH + board port
 include(cmake/rtthread.cmake)
 
+# Add FOC (pure C port of Ctrl-Step-Driver)
+include(cmake/foc.cmake)
+
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined library search paths
