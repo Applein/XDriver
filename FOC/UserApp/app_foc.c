@@ -366,6 +366,15 @@ void foc_app_init(void)
 /*   电流: mA                                                                 */
 /* ========================================================================== */
 
+/*
+ * msh 只注册一个顶层命令, 子命令列表见文件末尾的 foc_cli_usage()。
+ *
+ * 想改名只需改下面这个宏 (usage 文本用字符串拼接, 会自动跟随);
+ * 唯一还必须同步改的是文件末尾 MSH_CMD_EXPORT_ALIAS 里的字面量 ——
+ * finsh 的宏会先对参数做字符串化, 宏不会被展开。
+ */
+#define FOC_CMD_NAME                "xdrv"
+
 /* 改设定点时要与 20 kHz 中断互斥, 避免读到半个结构体 */
 #define FOC_CMD_ENTER_CRITICAL()    rt_base_t level_ = rt_hw_interrupt_disable()
 #define FOC_CMD_EXIT_CRITICAL()     rt_hw_interrupt_enable(level_)
@@ -397,7 +406,7 @@ static bool foc_flash_write_allowed(const char *who)
 
     rt_kprintf("refuse %s: motor is active (mode=%s)\n", who,
                foc_mode_name(motor.controller->mode_running));
-    rt_kprintf("        run 'foc_mode stop' or 'foc_disable' first, then retry\n");
+    rt_kprintf("        run '" FOC_CMD_NAME " mode stop' or '" FOC_CMD_NAME " off' first\n");
 
     return false;
 }
@@ -458,7 +467,6 @@ static void foc_cmd_status(int argc, char **argv)
                (unsigned)boardConfig.can_node_id, (int)boardConfig.current_limit,
                (int)boardConfig.velocity_limit, (int)boardConfig.velocity_acc);
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_status, foc_status, show FOC status);
 
 static void foc_cmd_cali(int argc, char **argv)
 {
@@ -470,16 +478,15 @@ static void foc_cmd_cali(int argc, char **argv)
      * 同时也避免 CALI_CALCULATING 阶段写 32KB Flash 时电机还在出力。 */
     if (motor.controller->mode_running != MOTOR_MODE_STOP)
     {
-        rt_kprintf("refuse foc_cali: motor is active (mode=%s)\n",
+        rt_kprintf("refuse cali: motor is active (mode=%s)\n",
                    foc_mode_name(motor.controller->mode_running));
-        rt_kprintf("        run 'foc_mode stop' first, then retry\n");
+        rt_kprintf("        run '" FOC_CMD_NAME " mode stop' first\n");
         return;
     }
 
     encoderCalibrator.is_triggered = true;
     rt_kprintf("calibration triggered (takes a few seconds, motor will rotate)\n");
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_cali, foc_cali, start encoder calibration);
 
 static void foc_cmd_mode(int argc, char **argv)
 {
@@ -487,7 +494,7 @@ static void foc_cmd_mode(int argc, char **argv)
 
     if (argc != 2)
     {
-        rt_kprintf("usage: foc_mode stop|pos|vel|cur\n");
+        rt_kprintf("usage: " FOC_CMD_NAME " mode stop|pos|vel|cur\n");
         return;
     }
 
@@ -509,7 +516,7 @@ static void foc_cmd_mode(int argc, char **argv)
     }
     else
     {
-        rt_kprintf("usage: foc_mode stop|pos|vel|cur\n");
+        rt_kprintf("usage: " FOC_CMD_NAME " mode stop|pos|vel|cur\n");
         return;
     }
 
@@ -517,7 +524,6 @@ static void foc_cmd_mode(int argc, char **argv)
     motor.controller->request_mode = mode;
     FOC_CMD_EXIT_CRITICAL();
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_mode, foc_mode, set control mode);
 
 static void foc_cmd_pos(int argc, char **argv)
 {
@@ -525,7 +531,7 @@ static void foc_cmd_pos(int argc, char **argv)
 
     if ((argc != 2) || (rt_strcmp(argv[1], "-h") == 0))
     {
-        rt_kprintf("usage: foc_pos <milli-rev>   (1000 = 1.000 rev)\n");
+        rt_kprintf("usage: " FOC_CMD_NAME " pos <milli-rev>   (1000 = 1.000 rev)\n");
         return;
     }
     mrev = (int32_t)atoi(argv[1]);
@@ -540,7 +546,6 @@ static void foc_cmd_pos(int argc, char **argv)
         (int32_t)(((int64_t)mrev * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS) / 1000));
     FOC_CMD_EXIT_CRITICAL();
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_pos, foc_pos, set position (milli-rev));
 
 static void foc_cmd_vel(int argc, char **argv)
 {
@@ -548,7 +553,7 @@ static void foc_cmd_vel(int argc, char **argv)
 
     if ((argc != 2) || (rt_strcmp(argv[1], "-h") == 0))
     {
-        rt_kprintf("usage: foc_vel <milli-rev/s>   (1000 = 1 rev/s)\n");
+        rt_kprintf("usage: " FOC_CMD_NAME " vel <milli-rev/s>   (1000 = 1 rev/s)\n");
         return;
     }
     mrps = (int32_t)atoi(argv[1]);
@@ -564,7 +569,6 @@ static void foc_cmd_vel(int argc, char **argv)
         (int32_t)(((int64_t)mrps * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS) / 1000));
     FOC_CMD_EXIT_CRITICAL();
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_vel, foc_vel, set velocity (milli-rev/s));
 
 static void foc_cmd_cur(int argc, char **argv)
 {
@@ -572,7 +576,7 @@ static void foc_cmd_cur(int argc, char **argv)
 
     if ((argc != 2) || (rt_strcmp(argv[1], "-h") == 0))
     {
-        rt_kprintf("usage: foc_cur <mA>\n");
+        rt_kprintf("usage: " FOC_CMD_NAME " cur <mA>\n");
         return;
     }
     ma = (int32_t)atoi(argv[1]);
@@ -585,7 +589,6 @@ static void foc_cmd_cur(int argc, char **argv)
     motion_ctrl_set_current_set_point(motor.controller, ma);
     FOC_CMD_EXIT_CRITICAL();
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_cur, foc_cur, set current (mA));
 
 static void foc_cmd_enable(int argc, char **argv)
 {
@@ -602,7 +605,6 @@ static void foc_cmd_enable(int argc, char **argv)
     FOC_CMD_EXIT_CRITICAL();
     rt_kprintf("motor enabled\n");
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_enable, foc_enable, enable motor);
 
 static void foc_cmd_disable(int argc, char **argv)
 {
@@ -614,7 +616,6 @@ static void foc_cmd_disable(int argc, char **argv)
     FOC_CMD_EXIT_CRITICAL();
     rt_kprintf("motor disabled\n");
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_disable, foc_disable, disable motor);
 
 static void foc_cmd_brake(int argc, char **argv)
 {
@@ -626,7 +627,6 @@ static void foc_cmd_brake(int argc, char **argv)
     FOC_CMD_EXIT_CRITICAL();
     rt_kprintf("motor braked\n");
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_brake, foc_brake, brake motor);
 
 static void foc_cmd_home(int argc, char **argv)
 {
@@ -634,7 +634,7 @@ static void foc_cmd_home(int argc, char **argv)
     (void)argv;
 
     /* 会立即触发 Flash 写入 (CONFIG_COMMIT -> 100Hz 线程), 必须停机 */
-    if (!foc_flash_write_allowed("foc_home"))
+    if (!foc_flash_write_allowed("home"))
     {
         return;
     }
@@ -647,7 +647,6 @@ static void foc_cmd_home(int argc, char **argv)
     FOC_CMD_EXIT_CRITICAL();
     rt_kprintf("home offset applied & queued for save\n");
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_home, foc_home, apply current position as home);
 
 static void foc_cmd_save(int argc, char **argv)
 {
@@ -655,7 +654,7 @@ static void foc_cmd_save(int argc, char **argv)
     (void)argv;
 
     /* 会立即触发 Flash 写入 (CONFIG_COMMIT -> 100Hz 线程), 必须停机 */
-    if (!foc_flash_write_allowed("foc_save"))
+    if (!foc_flash_write_allowed("save"))
     {
         return;
     }
@@ -663,7 +662,6 @@ static void foc_cmd_save(int argc, char **argv)
     boardConfig.config_status = CONFIG_COMMIT;
     rt_kprintf("config queued for save\n");
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_save, foc_save, save config to flash);
 
 /* ========================================================================== */
 /* 上板调试命令 (仅用于验证, 不属于上游功能)                                   */
@@ -701,26 +699,25 @@ static void foc_cmd_enc(int argc, char **argv)
 
     if (status == HAL_OK)
     {
-        rt_kprintf("hint   : SPI 通路正常, 可以 foc_ctrl on 启动 20kHz\n");
+        rt_kprintf("hint   : SPI 通路正常, 可以 '" FOC_CMD_NAME " loop on' 启动 20kHz\n");
     }
     else
     {
         rt_kprintf("hint   : 检查 MT6816 供电 / PB3-PB5 接线 / PA15 片选, 不要启动 20kHz\n");
     }
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_enc, foc_enc, probe MT6816 SPI link);
 
 /*
- * foc_ctrl —— 手动启停 20 kHz 闭环
- *   foc_ctrl off : 上电后先关掉闭环, 方便量波形/查寄存器
- *   foc_ctrl on  : 确认 SPI 正常后再启动
+ * loop —— 手动启停 20 kHz 闭环 (子命令 "loop")
+ *   xdrv loop off : 上电后先关掉闭环, 方便量波形/查寄存器
+ *   xdrv loop on  : 确认 SPI 正常后再启动
  * 注意: 系统上电默认已启动, 本命令用于 bring-up 阶段临时关闭。
  */
-static void foc_cmd_ctrl(int argc, char **argv)
+static void foc_cmd_loop(int argc, char **argv)
 {
     if (argc != 2)
     {
-        rt_kprintf("usage: foc_ctrl on|off   (running=%d)\n",
+        rt_kprintf("usage: " FOC_CMD_NAME " loop on|off   (running=%d)\n",
                    (TIM4->CR1 & TIM_CR1_CEN) ? 1 : 0);
         return;
     }
@@ -738,7 +735,114 @@ static void foc_cmd_ctrl(int argc, char **argv)
     }
     else
     {
-        rt_kprintf("usage: foc_ctrl on|off\n");
+        rt_kprintf("usage: " FOC_CMD_NAME " loop on|off\n");
     }
 }
-MSH_CMD_EXPORT_ALIAS(foc_cmd_ctrl, foc_ctrl, start/stop 20kHz control loop);
+
+/* ========================================================================== */
+/* 顶层命令分发                                                               */
+/*                                                                           */
+/* msh 里只注册一个命令名 (FOC_CMD_NAME), 以减少 help 输出的噪声。             */
+/* 子命令一律按 "<cmd> <sub> [arg]" 的形式调用。                              */
+/* ========================================================================== */
+
+static void foc_cli_usage(void)
+{
+    rt_kprintf("usage: " FOC_CMD_NAME " <cmd> [arg]\n"
+               "\n"
+               "  status                  show state / pos / vel / current\n"
+               "  cali                    encoder calibration (motor must be stopped)\n"
+               "  mode <stop|pos|vel|cur> set control mode\n"
+               "  pos  <milli-rev>        target position    (1000 = 1.000 rev)\n"
+               "  vel  <milli-rev/s>      target velocity    (1000 = 1 rev/s)\n"
+               "  cur  <mA>               target current\n"
+               "  on | off | brake        enable / disable / brake\n"
+               "  home                    set current position as home\n"
+               "  save                    save config to flash\n"
+               "  enc                     probe MT6816 SPI link\n"
+               "  loop <on|off>           start/stop the 20kHz control loop\n"
+               "\n"
+               "  (no argument prints status)\n");
+}
+
+static void foc_cmd_xdrv(int argc, char **argv)
+{
+    const char *sub;
+
+    /* 只敲命令名 -> 直接打印状态 (最常用的操作) */
+    if (argc < 2)
+    {
+        foc_cmd_status(1, argv);
+        return;
+    }
+
+    sub = argv[1];
+
+    /* 参数平移一位: 让子命令函数仍以 argv[0]=子命令名, argv[1]=参数 的约定工作,
+     * 这样各子命令的实现与原先的平级命令完全一致。 */
+    argc--;
+    argv++;
+
+    if (rt_strcmp(sub, "status") == 0)
+    {
+        foc_cmd_status(argc, argv);
+    }
+    else if (rt_strcmp(sub, "cali") == 0)
+    {
+        foc_cmd_cali(argc, argv);
+    }
+    else if (rt_strcmp(sub, "mode") == 0)
+    {
+        foc_cmd_mode(argc, argv);
+    }
+    else if (rt_strcmp(sub, "pos") == 0)
+    {
+        foc_cmd_pos(argc, argv);
+    }
+    else if (rt_strcmp(sub, "vel") == 0)
+    {
+        foc_cmd_vel(argc, argv);
+    }
+    else if (rt_strcmp(sub, "cur") == 0)
+    {
+        foc_cmd_cur(argc, argv);
+    }
+    else if (rt_strcmp(sub, "on") == 0)
+    {
+        foc_cmd_enable(argc, argv);
+    }
+    else if (rt_strcmp(sub, "off") == 0)
+    {
+        foc_cmd_disable(argc, argv);
+    }
+    else if (rt_strcmp(sub, "brake") == 0)
+    {
+        foc_cmd_brake(argc, argv);
+    }
+    else if (rt_strcmp(sub, "home") == 0)
+    {
+        foc_cmd_home(argc, argv);
+    }
+    else if (rt_strcmp(sub, "save") == 0)
+    {
+        foc_cmd_save(argc, argv);
+    }
+    else if (rt_strcmp(sub, "enc") == 0)
+    {
+        foc_cmd_enc(argc, argv);
+    }
+    else if (rt_strcmp(sub, "loop") == 0)
+    {
+        foc_cmd_loop(argc, argv);
+    }
+    else if ((rt_strcmp(sub, "help") == 0) || (rt_strcmp(sub, "?") == 0))
+    {
+        foc_cli_usage();
+    }
+    else
+    {
+        rt_kprintf("unknown cmd '%s'\n", sub);
+        foc_cli_usage();
+    }
+}
+MSH_CMD_EXPORT_ALIAS(foc_cmd_xdrv, xdrv, XDriver motor control (type 'xdrv help'));

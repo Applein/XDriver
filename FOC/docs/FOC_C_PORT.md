@@ -176,9 +176,31 @@ arm-none-eabi-gcc <同上 flags> \
 | `TIM4_IRQHandler` → `foc_tick_20khz(); return;` | `Core/Src/stm32f1xx_it.c` 的 USER CODE 段 |
 | `main()` → `foc_app_init()` | `Core/Src/main.c` 的 USER CODE 段 |
 | 100 Hz 家务线程（按键 / LED / 校准主循环 / CONFIG_COMMIT） | `FOC/UserApp/app_foc.c` |
-| msh 命令 `foc_status/foc_cali/foc_mode/foc_pos/foc_vel/foc_cur/foc_enable/foc_disable/foc_brake/foc_home/foc_save` | `FOC/UserApp/app_foc.c` |
-| 上板调试命令 `foc_enc`（MT6816 SPI 探针） / `foc_ctrl on\|off`（手动启停 20 kHz） | `FOC/UserApp/app_foc.c` |
+| msh 命令（**只注册一个顶层命令** `xdrv`，其余为子命令） | `FOC/UserApp/app_foc.c` |
 | `FOC_AUTOSTART_20KHZ` 开关（首刷排障用，默认 1） | `FOC/UserApp/app_foc.c` |
+
+### msh 命令：`xdrv`
+
+为避免污染 `help` 输出，所有 FOC 操作收敛到单个命令 `xdrv`；
+不带参数直接打印状态，`xdrv help` 列出全部子命令。
+
+| 子命令 | 作用 |
+|---|---|
+| `xdrv` / `xdrv status` | 状态：state / mode / pos(mrev) / vel(mrev/s) / current(mA) / calib / cfg |
+| `xdrv cali` | 编码器校准（要求电机已停止） |
+| `xdrv mode <stop\|pos\|vel\|cur>` | 切换控制模式 |
+| `xdrv pos <milli-rev>` | 目标位置（1000 = 1.000 圈） |
+| `xdrv vel <milli-rev/s>` | 目标速度（1000 = 1 圈/秒） |
+| `xdrv cur <mA>` | 目标电流 |
+| `xdrv on` / `xdrv off` / `xdrv brake` | 使能 / 失能 / 制动 |
+| `xdrv home` | 把当前位置设为零点（要求停机） |
+| `xdrv save` | 保存配置到 Flash（要求停机） |
+| `xdrv enc` | MT6816 SPI 通路探测 |
+| `xdrv loop <on\|off>` | 手动启停 20 kHz 闭环 |
+| `xdrv help` / `xdrv ?` | 用法 |
+
+改命令名只需改 `app_foc.c` 里的 `FOC_CMD_NAME` 宏 + 末尾
+`MSH_CMD_EXPORT_ALIAS` 的字面量（finsh 的宏会先字符串化参数，宏不会展开）。
 
 ### Flash 写入保护
 
@@ -187,12 +209,12 @@ PWM 保持最后比较值 → 电机以旧力矩继续推。因此三个命令�
 
 | 命令 | 保护条件 |
 |---|---|
-| `foc_cali` | `mode_running == MOTOR_MODE_STOP`（校准会强行推电机转两圈） |
-| `foc_home` | `foc_flash_write_allowed()`：`mode_running == STOP` 或 `soft_disable` |
-| `foc_save` | 同上 |
+| `xdrv cali` | `mode_running == MOTOR_MODE_STOP`（校准会强行推电机转两圈） |
+| `xdrv home` | `foc_flash_write_allowed()`：`mode_running == STOP` 或 `soft_disable` |
+| `xdrv save` | 同上 |
 
 不满足时打印 `refuse <cmd>: motor is active (mode=...)` 并提示先
-`foc_mode stop` 或 `foc_disable`。
+`xdrv mode stop` 或 `xdrv off`。
 
 ### 已知风险（需上硬件验证）
 
