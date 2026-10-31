@@ -743,8 +743,17 @@ static void motor_close_loop_control_tick(Motor *self)
             }
         }
 
-        /* 过载检测 */
-        if ((controller->mode_running != MOTOR_MODE_COMMAND_CURRENT) &&
+        /*
+         * 过载检测
+         *
+         * 必须额外判断 rated_current > 0:
+         *   判定用的是 current == rated_current, 若限流被误配成 0,
+         *   则 abs(foc_current)==0 恒成立 -> 永远"过载";
+         *   同时输出也被限幅到 0 -> 电机完全没有力矩、不转。
+         *   两个现象会同时出现, 极易被误判成硬件故障。
+         */
+        if ((self->config.motion_params.rated_current > 0) &&
+            (controller->mode_running != MOTOR_MODE_COMMAND_CURRENT) &&
             (controller->mode_running != MOTOR_MODE_PWM_CURRENT) &&
             (current == self->config.motion_params.rated_current))
         {
@@ -769,7 +778,17 @@ static void motor_close_loop_control_tick(Motor *self)
     {
         controller->state = MOTOR_STATE_NO_CALIB;
     }
-    else if (controller->mode_running == MOTOR_MODE_STOP)
+    /*
+     * 功率级关断的情况统一报告 STOP:
+     *   mode_running == STOP   闭环进入 STOP 分支 (每 tick driver_sleep)
+     *   soft_disable           'xdrv off'   置位, 第一个分支走 driver_sleep
+     *   soft_brake             'xdrv brake' 置位, 第二个分支走 driver_brake
+     * 否则 'off' 之后 mode_running 仍是 vel/pos, 状态机会误报 RUNNING —— 明明
+     * 轴已经松开却显示"正在运行", 这是把 'off' 当作"停止"使用时的最大误导。
+     */
+    else if ((controller->mode_running == MOTOR_MODE_STOP) ||
+             controller->soft_disable ||
+             controller->soft_brake)
     {
         controller->state = MOTOR_STATE_STOP;
     }

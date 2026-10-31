@@ -28,6 +28,7 @@
 #include <rthw.h>       /* rt_hw_interrupt_disable / enable */
 
 #include "main.h"
+#include "rt_board.h"   /* console_err_ore / console_err_other (控制台诊断计数) */
 #include "spi.h"
 #include "tim.h"
 
@@ -159,6 +160,69 @@ static void on_button2_event(ButtonEvent event)
 /* 配置载入 / 保存                                                            */
 /* ========================================================================== */
 
+/* 出厂默认值 (恢复配置时复用, 避免两处写不同的数字) */
+static void board_config_set_defaults(uint16_t node_id)
+{
+    boardConfig.config_status = CONFIG_OK;
+    boardConfig.can_node_id = node_id;
+    boardConfig.encoder_home_offset = 0;
+    boardConfig.default_mode = (uint32_t)MOTOR_MODE_COMMAND_POSITION;
+    boardConfig.current_limit = 1 * 1000;                               /* mA */
+    boardConfig.velocity_limit = 30 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS; /* r/s */
+    boardConfig.velocity_acc = 100 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;  /* r/s^2 */
+    boardConfig.calibration_current = 2000;
+    boardConfig.dce_kp = 200;
+    boardConfig.dce_kv = 80;
+    boardConfig.dce_ki = 300;
+    boardConfig.dce_kd = 250;
+    boardConfig.enable_motor_on_boot = false;
+    boardConfig.enable_stall_protect = false;
+}
+
+/*
+ * 配置合法性检查
+ *
+ * 为什么必须有: 配置页位于 0x0801FC00, 掉电、Flash 写失败、或结构体布局
+ * 变更 (字段增删) 都会让它读出一堆无意义的值。而 config_status 恰好可能
+ * 仍是 CONFIG_OK, 于是坏配置被当成"有效"直接用下去。
+ *
+ * 最典型的破坏是 current_limit = 0, 后果有两重且互相掩盖:
+ *   1. 输出被限幅到 0      -> 电机不出力, 完全不转
+ *   2. current == limit    -> abs(foc_current)==0 与 limit==0 恒相等,
+ *                            1 秒后永久报 OVERLOAD
+ * 用户看到"不转 + 过载", 很容易误判成驱动或编码器坏了。
+ */
+static bool board_config_is_sane(void)
+{
+    if (boardConfig.config_status != CONFIG_OK)
+    {
+        return false;
+    }
+    if ((boardConfig.current_limit <= 0) || (boardConfig.current_limit > 5000))
+    {
+        return false;
+    }
+    if ((boardConfig.velocity_limit <= 0) ||
+        (boardConfig.velocity_limit > 200 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS))
+    {
+        return false;
+    }
+    if ((boardConfig.velocity_acc <= 0) ||
+        (boardConfig.velocity_acc > 2000 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS))
+    {
+        return false;
+    }
+    if ((boardConfig.default_mode != (uint32_t)MOTOR_MODE_STOP) &&
+        (boardConfig.default_mode != (uint32_t)MOTOR_MODE_COMMAND_POSITION) &&
+        (boardConfig.default_mode != (uint32_t)MOTOR_MODE_COMMAND_VELOCITY) &&
+        (boardConfig.default_mode != (uint32_t)MOTOR_MODE_COMMAND_CURRENT))
+    {
+        return false;
+    }
+
+    return true;
+}
+
 /* 上游 Main() 里"EEPROM 里没有有效配置时写入默认值"的那段 */
 static void load_board_config(void)
 {
@@ -194,23 +258,15 @@ static void load_board_config(void)
     /* 上游: EEPROM eeprom; eeprom.get(0, boardConfig); */
     eeprom_get_blob(0, &boardConfig, (uint16_t)sizeof(boardConfig));
 
-    if (boardConfig.config_status != CONFIG_OK)
+    if (!board_config_is_sane())
     {
         /* 上游: boardConfig = BoardConfig_t{ ... }; eeprom.put(0, boardConfig); */
-        boardConfig.config_status = CONFIG_OK;
-        boardConfig.can_node_id = default_node_id;
-        boardConfig.encoder_home_offset = 0;
-        boardConfig.default_mode = (uint32_t)MOTOR_MODE_COMMAND_POSITION;
-        boardConfig.current_limit = 1 * 1000;                                   /* mA */
-        boardConfig.velocity_limit = 30 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;     /* r/s */
-        boardConfig.velocity_acc = 100 * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS;      /* r/s^2 */
-        boardConfig.calibration_current = 2000;
-        boardConfig.dce_kp = 200;
-        boardConfig.dce_kv = 80;
-        boardConfig.dce_ki = 300;
-        boardConfig.dce_kd = 250;
-        boardConfig.enable_motor_on_boot = false;
-        boardConfig.enable_stall_protect = false;
+        rt_kprintf("config: invalid page content, restoring defaults\n"
+                   "        (was status=%d limit=%d vel=%d acc=%d)\n",
+                   (int)boardConfig.config_status, (int)boardConfig.current_limit,
+                   (int)boardConfig.velocity_limit, (int)boardConfig.velocity_acc);
+
+        board_config_set_defaults(default_node_id);
 
         eeprom_put_blob(0, &boardConfig, (uint16_t)sizeof(boardConfig));
     }
@@ -283,8 +339,37 @@ static void foc_housekeeping_entry(void *parameter)
 /* 20 kHz 中断入口                                                            */
 /* ========================================================================== */
 
+/*
+ * ISR 耗时统计 (DWT 周期计数器)
+ *
+ * 为什么需要: TIM4 是抢占优先级 0, 一旦某次 ISR 拖长, USART1 (优先级 5)
+ * 就会被推迟, 115200 下超过 ~174us 就开始丢字节 —— 表现就是"串口输入没反应"。
+ * 有了 max 值就能直接判断是不是这个原因, 而不是靠猜。
+ *
+ * DWT->CYCCNT 是 32 位递增计数器, 72MHz 下约 59.6 秒回绕一次,
+ * 单次相减得到的增量在回绕处仍然正确。
+ */
+static volatile uint32_t foc_isr_cycles_last = 0;
+static volatile uint32_t foc_isr_cycles_max = 0;
+static volatile uint32_t foc_isr_count = 0;
+
+static void foc_isr_stats_init(void)
+{
+    /* 使能 DWT 周期计数器 (Cortex-M3 标准做法) */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    foc_isr_cycles_last = 0;
+    foc_isr_cycles_max = 0;
+    foc_isr_count = 0;
+}
+
 void foc_tick_20khz(void)
 {
+    uint32_t t0 = DWT->CYCCNT;
+    uint32_t used;
+
     /* 上游 Tim4Callback20kHz() 第一句 */
     __HAL_TIM_CLEAR_IT(&htim4, TIM_IT_UPDATE);
 
@@ -296,6 +381,14 @@ void foc_tick_20khz(void)
     {
         motor_tick_20khz(&motor);
     }
+
+    used = DWT->CYCCNT - t0;
+    foc_isr_cycles_last = used;
+    if (used > foc_isr_cycles_max)
+    {
+        foc_isr_cycles_max = used;
+    }
+    foc_isr_count++;
 }
 
 /* ========================================================================== */
@@ -344,6 +437,8 @@ void foc_app_init(void)
     }
 
     /* ---------- 9. 启动 100 Hz 家务线程 ---------- */
+    foc_isr_stats_init();
+
     rt_thread_init(&foc_housekeeping_thread, "foc_hk", foc_housekeeping_entry, RT_NULL,
                    foc_housekeeping_stack, sizeof(foc_housekeeping_stack),
                    FOC_HOUSEKEEPING_PRIORITY, 10);
@@ -406,16 +501,39 @@ static bool foc_flash_write_allowed(const char *who)
 
     rt_kprintf("refuse %s: motor is active (mode=%s)\n", who,
                foc_mode_name(motor.controller->mode_running));
-    rt_kprintf("        run '" FOC_CMD_NAME " mode stop' or '" FOC_CMD_NAME " off' first\n");
+    rt_kprintf("        run '" FOC_CMD_NAME " off' first\n");
 
     return false;
 }
 
+/*
+ * 下设定点即视为"要电机出力"。
+ *
+ * 必须顺手清掉 disable / brake: 闭环 tick 的前两个分支分别是
+ *     if (is_stalled || soft_disable || !calibrated) driver_sleep();
+ *     else if (soft_brake)                           driver_brake();
+ * 它们根本不看 mode_running。所以 'xdrv off' 之后再 'xdrv pos/vel/cur'
+ * 会静默不动 —— 命令看起来生效了, 实际什么都没发生。
+ */
+static void foc_motion_prepare(void)
+{
+    motion_ctrl_set_disable(motor.controller, false);
+    motion_ctrl_set_brake(motor.controller, false);
+}
+
+/*
+ * 控制模式的显示名。
+ *
+ * MOTOR_MODE_STOP 必须叫 "idle" 而不是 "stop":
+ *   state 里的 STOP 是"功率级已关断"(可能因为 off / brake / mode 无控制环),
+ *   mode 里的 stop  是"没有控制环在跑"。两者不是一回事, 名字必須区分开,
+ *   否则 status 会同时打印两行 stop, 看到的人无法判断该信哪个。
+ */
 static const char *foc_mode_name(MotorMode mode)
 {
     switch (mode)
     {
-    case MOTOR_MODE_STOP:               return "stop";
+    case MOTOR_MODE_STOP:               return "idle";
     case MOTOR_MODE_COMMAND_POSITION:   return "pos";
     case MOTOR_MODE_COMMAND_VELOCITY:   return "vel";
     case MOTOR_MODE_COMMAND_CURRENT:    return "cur";
@@ -426,6 +544,26 @@ static const char *foc_mode_name(MotorMode mode)
     case MOTOR_MODE_STEP_DIR:           return "step-dir";
     default:                            return "?";
     }
+}
+
+/*
+ * 功率级状态。state 的 STOP 有三个不同原因, 这一行把它们分开:
+ *   asleep   soft_disable 生效 (off), 线圈断开, 轴可自由转动
+ *   brake    soft_brake  生效 (brake), 线圈短路, 轴变硬
+ *   active   其它情况: 要么有控制环在跑, 要么还在归零途中
+ */
+static const char *foc_power_name(MotionController *c)
+{
+    if (c->soft_disable)
+    {
+        return "asleep (coils open)";
+    }
+    if (c->soft_brake)
+    {
+        return "brake (coils shorted)";
+    }
+
+    return "active";
 }
 
 static const char *foc_state_name(MotorState state)
@@ -456,8 +594,20 @@ static void foc_cmd_status(int argc, char **argv)
     vel_mrps = (int32_t)(((int64_t)c->est_velocity * 1000) / MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS);
 
     rt_kprintf("state   : %s\n", foc_state_name(c->state));
-    rt_kprintf("mode    : %s (request %s)\n", foc_mode_name(c->mode_running),
-               foc_mode_name(c->request_mode));
+    rt_kprintf("power   : %s\n", foc_power_name(c));
+
+    /* request 与 running 通常一致 (20kHz 一个周期内就会同步);
+     * 只有切换瞬间才不同, 那种情况下附在后面, 避免稳态输出噪声。 */
+    if (c->request_mode == c->mode_running)
+    {
+        rt_kprintf("mode    : %s\n", foc_mode_name(c->mode_running));
+    }
+    else
+    {
+        rt_kprintf("mode    : %s -> %s\n", foc_mode_name(c->mode_running),
+                   foc_mode_name(c->request_mode));
+    }
+
     rt_kprintf("pos     : %d (mrev)\n", pos_mrev);
     rt_kprintf("vel     : %d (mrev/s)\n", vel_mrps);
     rt_kprintf("current : %d (mA)\n", c->foc_current);
@@ -466,6 +616,34 @@ static void foc_cmd_status(int argc, char **argv)
     rt_kprintf("cfg     : node=%u limit=%dmA vel=%d acc=%d\n",
                (unsigned)boardConfig.can_node_id, (int)boardConfig.current_limit,
                (int)boardConfig.velocity_limit, (int)boardConfig.velocity_acc);
+
+    /*
+     * 实时性诊断 —— 判断"串口输入没反应"是不是 20 kHz 中断造成的:
+     *   isr max 应 < 约 45us (3240 周期)。20kHz 周期才 50us,
+     *   max 一旦逼近 50us, USART1 (优先级 5) 就会被长期推迟而丢字节。
+     *   spi_err 非 0 且增长 => 编码器 SPI 通路有问题 (每 tick 都在超时重试)。
+     */
+    rt_kprintf("isr     : last=%lu max=%lu cyc (%lu.%02lu us), n=%lu\n",
+               (unsigned long)foc_isr_cycles_last,
+               (unsigned long)foc_isr_cycles_max,
+               (unsigned long)(foc_isr_cycles_max / 72U),
+               (unsigned long)((foc_isr_cycles_max % 72U) * 100U / 72U),
+               (unsigned long)foc_isr_count);
+    rt_kprintf("spi_err : %lu (mt6816 timeouts)\n",
+               (unsigned long)mt6816_spi_fail_count);
+    if (mt6816_spi_fail_count != 0U)
+    {
+        /* 分类计数 + 出错瞬间的寄存器快照, 用来区分软件还是硬件 */
+        rt_kprintf("spi_fail: txe=%lu rxne=%lu bsy=%lu  sr=0x%04x cr1=0x%04x\n",
+                   (unsigned long)mt6816_spi_err_txe,
+                   (unsigned long)mt6816_spi_err_rxne,
+                   (unsigned long)mt6816_spi_err_bsy,
+                   (unsigned)mt6816_spi_last_sr,
+                   (unsigned)mt6816_spi_last_cr1);
+    }
+    rt_kprintf("uart    : ore=%lu err=%lu  (rx lost if growing)\n",
+               (unsigned long)console_err_ore,
+               (unsigned long)console_err_other);
 }
 
 static void foc_cmd_cali(int argc, char **argv)
@@ -473,56 +651,17 @@ static void foc_cmd_cali(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    /* 校准过程中电机会被强制推着转两圈, 必须确认当前不在闭环运行态,
-     * 否则会在上一个模式的控制输出上叠加校准电流矢量。
-     * 同时也避免 CALI_CALCULATING 阶段写 32KB Flash 时电机还在出力。 */
-    if (motor.controller->mode_running != MOTOR_MODE_STOP)
+    /* 校准要写 32KB Flash (CPU 停 20~40ms), 且会用电流矢量强行推着电机
+     * 转两圈, 因此必须先用 'off' 让功率级休眠、轴松手。
+     * 统一用 foc_flash_write_allowed(), 与 home/save 同一套判定,
+     * 不再单独看 mode_running —— 否则 'off' 之后会被误拒。 */
+    if (!foc_flash_write_allowed("cali"))
     {
-        rt_kprintf("refuse cali: motor is active (mode=%s)\n",
-                   foc_mode_name(motor.controller->mode_running));
-        rt_kprintf("        run '" FOC_CMD_NAME " mode stop' first\n");
         return;
     }
 
     encoderCalibrator.is_triggered = true;
     rt_kprintf("calibration triggered (takes a few seconds, motor will rotate)\n");
-}
-
-static void foc_cmd_mode(int argc, char **argv)
-{
-    MotorMode mode;
-
-    if (argc != 2)
-    {
-        rt_kprintf("usage: " FOC_CMD_NAME " mode stop|pos|vel|cur\n");
-        return;
-    }
-
-    if (rt_strcmp(argv[1], "stop") == 0)
-    {
-        mode = MOTOR_MODE_STOP;
-    }
-    else if (rt_strcmp(argv[1], "pos") == 0)
-    {
-        mode = MOTOR_MODE_COMMAND_POSITION;
-    }
-    else if (rt_strcmp(argv[1], "vel") == 0)
-    {
-        mode = MOTOR_MODE_COMMAND_VELOCITY;
-    }
-    else if (rt_strcmp(argv[1], "cur") == 0)
-    {
-        mode = MOTOR_MODE_COMMAND_CURRENT;
-    }
-    else
-    {
-        rt_kprintf("usage: " FOC_CMD_NAME " mode stop|pos|vel|cur\n");
-        return;
-    }
-
-    FOC_CMD_ENTER_CRITICAL();
-    motor.controller->request_mode = mode;
-    FOC_CMD_EXIT_CRITICAL();
 }
 
 static void foc_cmd_pos(int argc, char **argv)
@@ -537,10 +676,8 @@ static void foc_cmd_pos(int argc, char **argv)
     mrev = (int32_t)atoi(argv[1]);
 
     FOC_CMD_ENTER_CRITICAL();
-    if (motor.controller->mode_running != MOTOR_MODE_COMMAND_POSITION)
-    {
-        motor.controller->request_mode = MOTOR_MODE_COMMAND_POSITION;
-    }
+    foc_motion_prepare();
+    motor.controller->request_mode = MOTOR_MODE_COMMAND_POSITION;
     motion_ctrl_set_position_set_point(
         motor.controller,
         (int32_t)(((int64_t)mrev * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS) / 1000));
@@ -559,11 +696,14 @@ static void foc_cmd_vel(int argc, char **argv)
     mrps = (int32_t)atoi(argv[1]);
 
     FOC_CMD_ENTER_CRITICAL();
+    foc_motion_prepare();
+    /* 与上游一致: 只在"进入"速度模式时把 rated_velocity 恢复成配置值,
+     * 避免每次下发设定点都覆盖掉已被收窄的限速。 */
     if (motor.controller->mode_running != MOTOR_MODE_COMMAND_VELOCITY)
     {
         motor.config.motion_params.rated_velocity = boardConfig.velocity_limit;
-        motor.controller->request_mode = MOTOR_MODE_COMMAND_VELOCITY;
     }
+    motor.controller->request_mode = MOTOR_MODE_COMMAND_VELOCITY;
     motion_ctrl_set_velocity_set_point(
         motor.controller,
         (int32_t)(((int64_t)mrps * MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS) / 1000));
@@ -582,10 +722,8 @@ static void foc_cmd_cur(int argc, char **argv)
     ma = (int32_t)atoi(argv[1]);
 
     FOC_CMD_ENTER_CRITICAL();
-    if (motor.controller->mode_running != MOTOR_MODE_COMMAND_CURRENT)
-    {
-        motor.controller->request_mode = MOTOR_MODE_COMMAND_CURRENT;
-    }
+    foc_motion_prepare();
+    motor.controller->request_mode = MOTOR_MODE_COMMAND_CURRENT;
     motion_ctrl_set_current_set_point(motor.controller, ma);
     FOC_CMD_EXIT_CRITICAL();
 }
@@ -595,6 +733,9 @@ static void foc_cmd_enable(int argc, char **argv)
     (void)argc;
     (void)argv;
 
+    /* 恢复出力。mode_running / request_mode 不被 'off' 修改, 所以这里会
+     * 回到停机前的模式与设定点; 只有开机后一直是 STOP 的情况才用
+     * boardConfig.default_mode (与上游按键逻辑一致)。 */
     FOC_CMD_ENTER_CRITICAL();
     motion_ctrl_set_disable(motor.controller, false);
     motion_ctrl_set_brake(motor.controller, false);
@@ -603,9 +744,21 @@ static void foc_cmd_enable(int argc, char **argv)
         motor.controller->request_mode = (MotorMode)boardConfig.default_mode;
     }
     FOC_CMD_EXIT_CRITICAL();
-    rt_kprintf("motor enabled\n");
+    rt_kprintf("motor enabled (mode=%s)\n",
+               foc_mode_name(motor.controller->request_mode));
 }
 
+/*
+ * off —— 失能 / 释放轴。
+ *
+ * 回周行为的唯一区别是"叫法": 上游区分了 MODE_STOP (模式) 和 SetDisable()
+ * (失能), 但两者对功率级的作用完全一样 —— 每 tick 都调 driver_sleep()。
+ * 所以这里只保留一个 'off', 避免用户纠结该用哪个。
+ *
+ * 注意: mode_running 不在这里改。一是为了让 'on' 能恢复到停机前的模式,
+ * 二是状态机已把 soft_disable 归为 MOTOR_STATE_STOP, 所以 'xdrv' 会正确
+ * 显示 STOP 而不是 RUNNING。
+ */
 static void foc_cmd_disable(int argc, char **argv)
 {
     (void)argc;
@@ -614,7 +767,7 @@ static void foc_cmd_disable(int argc, char **argv)
     FOC_CMD_ENTER_CRITICAL();
     motion_ctrl_set_disable(motor.controller, true);
     FOC_CMD_EXIT_CRITICAL();
-    rt_kprintf("motor disabled\n");
+    rt_kprintf("motor disabled, shaft released\n");
 }
 
 static void foc_cmd_brake(int argc, char **argv)
@@ -746,23 +899,31 @@ static void foc_cmd_loop(int argc, char **argv)
 /* 子命令一律按 "<cmd> <sub> [arg]" 的形式调用。                              */
 /* ========================================================================== */
 
+/*
+ * 精简用法说明
+ *
+ * 只保留一份总览, 不为每个子命令单独存说明文本 —— 13 份详细帮助要吃掉
+ * 约 5 KB Flash, 占 95 KB 代码区的 5%, 不划算。各子命令的具体语义写在
+ * 对应 foc_cmd_*() 函数的注释里, 需要时看源码。
+ *
+ * 逐行 rt_kprintf 而不是一个长字符串: rt_kprintf 的格式化缓冲是
+ * RT_CONSOLEBUF_SIZE (128 字节), 单次输出过长会被静默截断。
+ */
 static void foc_cli_usage(void)
 {
-    rt_kprintf("usage: " FOC_CMD_NAME " <cmd> [arg]\n"
-               "\n"
-               "  status                  show state / pos / vel / current\n"
-               "  cali                    encoder calibration (motor must be stopped)\n"
-               "  mode <stop|pos|vel|cur> set control mode\n"
-               "  pos  <milli-rev>        target position    (1000 = 1.000 rev)\n"
-               "  vel  <milli-rev/s>      target velocity    (1000 = 1 rev/s)\n"
-               "  cur  <mA>               target current\n"
-               "  on | off | brake        enable / disable / brake\n"
-               "  home                    set current position as home\n"
-               "  save                    save config to flash\n"
-               "  enc                     probe MT6816 SPI link\n"
-               "  loop <on|off>           start/stop the 20kHz control loop\n"
-               "\n"
-               "  (no argument prints status)\n");
+    rt_kprintf("usage: " FOC_CMD_NAME " [cmd] [arg]      (no arg = status)\n");
+    rt_kprintf("\n");
+    rt_kprintf("  pos <milli-rev>          absolute position, 1000 = 1 rev\n");
+    rt_kprintf("  vel <milli-rev/s>        speed, 1000 = 1 rev/s\n");
+    rt_kprintf("  cur <mA>                 current (torque)\n");
+    rt_kprintf("        ^ switch mode and energize the motor\n");
+    rt_kprintf("  on                       energize, resume the previous mode\n");
+    rt_kprintf("  off                      release the shaft (no torque)\n");
+    rt_kprintf("  brake                    short the coils (stiff, no current)\n");
+    rt_kprintf("  cali | home | save       calibrate / zero / flash [need 'off']\n");
+    rt_kprintf("  enc  | loop <on|off>     SPI probe / 20kHz control loop\n");
+    rt_kprintf("\n");
+    rt_kprintf("  no calibration -> no torque; run 'cali' with a free shaft\n");
 }
 
 static void foc_cmd_xdrv(int argc, char **argv)
@@ -790,10 +951,6 @@ static void foc_cmd_xdrv(int argc, char **argv)
     else if (rt_strcmp(sub, "cali") == 0)
     {
         foc_cmd_cali(argc, argv);
-    }
-    else if (rt_strcmp(sub, "mode") == 0)
-    {
-        foc_cmd_mode(argc, argv);
     }
     else if (rt_strcmp(sub, "pos") == 0)
     {

@@ -112,16 +112,17 @@ VS Code 任务（`Ctrl+Shift+P` → `Tasks: Run Task`）：
 
 | 命令 | 作用 |
 |---|---|
-| `xdrv` / `xdrv status` | 状态：state / mode / pos / vel / current / calib / cfg |
-| `xdrv help` | 子命令列表 |
-| `xdrv cali` | 编码器校准（要求电机已停止） |
-| `xdrv mode <stop\|pos\|vel\|cur>` | 切换控制模式 |
-| `xdrv pos <milli-rev>` | 目标位置，**1000 = 1.000 圈** |
-| `xdrv vel <milli-rev/s>` | 目标速度，**1000 = 1 圈/秒** |
-| `xdrv cur <mA>` | 目标电流 |
-| `xdrv on` / `off` / `brake` | 使能 / 失能 / 制动 |
-| `xdrv home` | 把当前位置设为零点（要求停机） |
-| `xdrv save` | 保存配置到 Flash（要求停机） |
+| `xdrv` / `xdrv status` | 状态：state / power / mode / pos / vel / current / calib / cfg / 诊断 |
+| `xdrv help` | 精简用法总览 |
+| `xdrv cali` | 编码器校准（要求先 `off`） |
+| `xdrv pos <milli-rev>` | 目标位置，**1000 = 1.000 圈**（自动切位置模式 + 使能） |
+| `xdrv vel <milli-rev/s>` | 目标速度，**1000 = 1 圈/秒**（自动切速度模式 + 使能） |
+| `xdrv cur <mA>` | 目标电流（自动切电流模式 + 使能） |
+| `xdrv on` | 使能，恢复停机前的模式与设定点 |
+| `xdrv off` | 失能，释放轴（无保持力矩）—— 也是唯一的“停止”命令 |
+| `xdrv brake` | 短路两相线圈，轴变硬（无电流制动） |
+| `xdrv home` | 把当前位置设为零点（要求先 `off`） |
+| `xdrv save` | 保存配置到 Flash（要求先 `off`） |
 | `xdrv enc` | MT6816 SPI 通路探测 |
 | `xdrv loop <on\|off>` | 手动启停 20 kHz 闭环 |
 
@@ -253,8 +254,8 @@ powershell -ExecutionPolicy Bypass -File tools\post_cubemx_patch.ps1
 | CAN 协议 | CAN1 硬件与位时序已配置（1 Mbit/s），应用层协议未实现 |
 | ADC | 母线电压 / 驱动温度采样未启用（源工程里也未被读取） |
 | step-dir 模式 | 枚举值保留，未接入（PA6 现用于调试指示） |
-| MT6816 超时 | 读角度用 `HAL_MAX_DELAY`，编码器掉线会导致 20 kHz 中断永久等待。首刷排障可先用 `xdrv enc` 探测 |
-| 配置版本 | `BoardConfig_t` 无 magic/version 字段，结构变更后旧 Flash 内容会被当成有效配置 |
+| MT6816 超时 | 读角度为**寄存器级有界实现**：等待上界 200 次循环（~28 µs），**并且失败后闩锁**（每 2048 次调用才重试一次），保证控制 ISR 永远不会占满 CPU。超时计入 `spi_err`，电机沿用上一次角度继续运行 |
+| 配置版本 | 启动时做**合法性校验**（限流/限速/加速度/默认模式范围），不合法则自动恢复出厂值并回写 Flash —— 避免坏配置导致“不转 + 永久 OVERLOAD” |
 
 ---
 

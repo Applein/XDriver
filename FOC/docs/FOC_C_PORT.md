@@ -186,18 +186,18 @@ arm-none-eabi-gcc <同上 flags> \
 
 | 子命令 | 作用 |
 |---|---|
-| `xdrv` / `xdrv status` | 状态：state / mode / pos(mrev) / vel(mrev/s) / current(mA) / calib / cfg |
+| `xdrv` / `xdrv status` | 状态：state / power / mode / pos(mrev) / vel(mrev/s) / current(mA) / calib / cfg / isr+spi_err+uart |
 | `xdrv cali` | 编码器校准（要求电机已停止） |
-| `xdrv mode <stop\|pos\|vel\|cur>` | 切换控制模式 |
-| `xdrv pos <milli-rev>` | 目标位置（1000 = 1.000 圈） |
-| `xdrv vel <milli-rev/s>` | 目标速度（1000 = 1 圈/秒） |
-| `xdrv cur <mA>` | 目标电流 |
-| `xdrv on` / `xdrv off` / `xdrv brake` | 使能 / 失能 / 制动 |
-| `xdrv home` | 把当前位置设为零点（要求停机） |
-| `xdrv save` | 保存配置到 Flash（要求停机） |
+| `xdrv mode <stop\|pos\|vel\|cur>` | （已删除：`pos/vel/cur` 自动切模式，`off` 就是停止） |
+| `xdrv pos <milli-rev>` | 目标位置（1000 = 1.000 圈），自动切模式并使能 |
+| `xdrv vel <milli-rev/s>` | 目标速度（1000 = 1 圈/秒），自动切模式并使能 |
+| `xdrv cur <mA>` | 目标电流，自动切模式并使能 |
+| `xdrv on` / `xdrv off` / `xdrv brake` | 使能 / 释放（= 停止） / 短路制动 |
+| `xdrv home` | 把当前位置设为零点（要求先 `off`） |
+| `xdrv save` | 保存配置到 Flash（要求先 `off`） |
 | `xdrv enc` | MT6816 SPI 通路探测 |
 | `xdrv loop <on\|off>` | 手动启停 20 kHz 闭环 |
-| `xdrv help` / `xdrv ?` | 用法 |
+| `xdrv help` / `xdrv ?` | 精简用法总览（不按子命令拆详细说明，省 Flash） |
 
 改命令名只需改 `app_foc.c` 里的 `FOC_CMD_NAME` 宏 + 末尾
 `MSH_CMD_EXPORT_ALIAS` 的字面量（finsh 的宏会先字符串化参数，宏不会展开）。
@@ -209,7 +209,7 @@ PWM 保持最后比较值 → 电机以旧力矩继续推。因此三个命令�
 
 | 命令 | 保护条件 |
 |---|---|
-| `xdrv cali` | `mode_running == MOTOR_MODE_STOP`（校准会强行推电机转两圈） |
+| `xdrv cali` | `foc_flash_write_allowed()`：`mode_running == STOP` 或 `soft_disable`（即先 `off`） |
 | `xdrv home` | `foc_flash_write_allowed()`：`mode_running == STOP` 或 `soft_disable` |
 | `xdrv save` | 同上 |
 
@@ -218,11 +218,16 @@ PWM 保持最后比较值 → 电机以旧力矩继续推。因此三个命令�
 
 ### 已知风险（需上硬件验证）
 
-1. **MT6816 缺失/损坏会锁死系统**：`mt6816_stm32_spi_transmit_and_read16()` 用
-   `HAL_SPI_TransmitReceive(..., HAL_MAX_DELAY)`，在 TIM4（优先级 0）中断里执行。
-   若 SPI 一直不返回，HAL 的 `HAL_GetTick()` 超时判断也无法推进（TIM1 时基优先级 15，
-   抢不到 CPU），20 kHz 中断将永久挂死。上游同样如此，硬件一致时可用；
-   若要加固，应在 `HAL_SPI_TransmitReceive` 外层加寄存器级超时计数。
+1. **MT6816 读角度：寄存器级有界 + 失败闩锁**
+   - 等待上界 `MT6816_SPI_GUARD = 200` 次循环（约 28 µs）
+   - 超时后置 `mt6816_spi_dead`，后续调用立即返回，每 `MT6816_SPI_RETRY_TICKS = 2048`
+     次调用才真正重试一次 —— 单次 `update_angle()` 会做 3 次重试 × 2 次传输，
+     若每次都真等到超时，50 µs 的控制周期会被吃掉数百 µs，串口输入彻底收不到
+   - 失败返回值 `0x0001`/`0x0000` 交替：上游校验是“1 的个数为偶数”，
+     若统一返回 0 则零字节恰好校验通过，角度会被读成 0 导致电机猛跳
+   - 原实现用 `HAL_SPI_TransmitReceive(..., HAL_MAX_DELAY)`，而 HAL 超时依赖
+     `HAL_GetTick()`（由 TIM1_UP 优先级 15 递增），在 TIM4（优先级 0）ISR 里
+     **永远不会推进**，等于无超时 → 死等导致整机锁死
 2. **`foc_tick_20khz()` 未调用 `rt_interrupt_enter/leave`**：这是刻意的，
    因为该路径不调用任何 RT-Thread API。若将来要在其中加 `rt_kprintf` 等调用，
    必须补上这两个钩子。

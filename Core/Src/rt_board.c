@@ -65,6 +65,15 @@ static volatile rt_uint16_t console_rx_head = 0U;   /* 中断写入位置 */
 static volatile rt_uint16_t console_rx_tail = 0U;   /* FinSH 读取位置 */
 static struct rt_semaphore  console_rx_sem;
 
+/*
+ * 诊断计数: USART 硬件错误
+ *   ore  接收溢出 —— 字节到了但中断来晚了 (典型原因: 高优先级中断占用太久)
+ *   ne   噪声 / fe 帧错 / pe 奇偶错 —— 接线、波特率、电平问题
+ * 正常运行时三者都应保持 0; 持续增长说明串口丢数据。
+ */
+volatile uint32_t console_err_ore = 0U;
+volatile uint32_t console_err_other = 0U;
+
 extern UART_HandleTypeDef huart1;
 
 /* -------------------------------------------------------------------------- */
@@ -75,6 +84,15 @@ void rt_hw_console_isr(void)
     /* 必须先读 SR 再读 DR, 才能清掉 RXNE/ORE/NE/FE/PE */
     rt_uint32_t sr = USART1->SR;
     rt_uint8_t  dr = (rt_uint8_t)USART1->DR;
+
+    if (sr & USART_SR_ORE)
+    {
+        console_err_ore++;
+    }
+    if (sr & (USART_SR_NE | USART_SR_FE | USART_SR_PE))
+    {
+        console_err_other++;
+    }
 
     if (sr & USART_SR_RXNE)
     {

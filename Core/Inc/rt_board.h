@@ -29,6 +29,15 @@ void rt_hw_board_init(void);
 /* USART1 中断服务: 把接收到的字节放入控制台环形缓冲 (在 USART1_IRQHandler 中调用) */
 void rt_hw_console_isr(void);
 
+/*
+ * 控制台接收诊断计数 (定义在 rt_board.c)
+ *   console_err_ore   接收溢出 (ORE) —— 中断来晚了, 通常是高优先级 ISR 占用过久
+ *   console_err_other 噪声/帧错/奇偶错 (NE/FE/PE) —— 接线、波特率、电平问题
+ * 正常运行时两者都应保持 0。
+ */
+extern volatile uint32_t console_err_ore;
+extern volatile uint32_t console_err_other;
+
 #ifdef __cplusplus
 }
 #endif
