@@ -353,6 +353,20 @@ static volatile uint32_t foc_isr_cycles_last = 0;
 static volatile uint32_t foc_isr_cycles_max = 0;
 static volatile uint32_t foc_isr_count = 0;
 
+/*
+ * 超期报警阈值
+ *
+ * TIM4 周期 = 50us = 3600 周期。留 10% 余量取 3240 (45us):
+ * 一旦某次 ISR 超过它, 说明已经侵占了本该留给主线程/串口的时间。
+ *   warn_count : 超过阈值的次数 (持续增长 => 控制环太重或 SPI 在超时)
+ *   warn_max   : 超期样本里的最大值
+ * 这两个计数只增不减, 由 xdrv 打印; 想清零请重启 (或执行 xdrv loop on)。
+ */
+#define FOC_ISR_BUDGET_CYCLES       3240U       /* 45us @ 72MHz */
+
+static volatile uint32_t foc_isr_warn_count = 0;
+static volatile uint32_t foc_isr_warn_max = 0;
+
 static void foc_isr_stats_init(void)
 {
     /* 使能 DWT 周期计数器 (Cortex-M3 标准做法) */
@@ -363,6 +377,8 @@ static void foc_isr_stats_init(void)
     foc_isr_cycles_last = 0;
     foc_isr_cycles_max = 0;
     foc_isr_count = 0;
+    foc_isr_warn_count = 0;
+    foc_isr_warn_max = 0;
 }
 
 void foc_tick_20khz(void)
@@ -388,6 +404,17 @@ void foc_tick_20khz(void)
     {
         foc_isr_cycles_max = used;
     }
+
+    /* 超期统计: 只在中断里累加计数, 不做任何打印/阻塞操作 */
+    if (used > FOC_ISR_BUDGET_CYCLES)
+    {
+        foc_isr_warn_count++;
+        if (used > foc_isr_warn_max)
+        {
+            foc_isr_warn_max = used;
+        }
+    }
+
     foc_isr_count++;
 }
 
@@ -657,6 +684,15 @@ static void foc_cmd_status(int argc, char **argv)
                (unsigned long)(foc_isr_cycles_max / 72U),
                (unsigned long)((foc_isr_cycles_max % 72U) * 100U / 72U),
                (unsigned long)foc_isr_count);
+
+    /* 超期报警: 只有真的超了才多打一行, 正常时保持输出简洁 */
+    if (foc_isr_warn_count != 0U)
+    {
+        rt_kprintf("isr_warn: %lu over budget, peak %lu cyc (%lu us > 45us)\n",
+                   (unsigned long)foc_isr_warn_count,
+                   (unsigned long)foc_isr_warn_max,
+                   (unsigned long)(foc_isr_warn_max / 72U));
+    }
     rt_kprintf("spi_err : %lu (mt6816 timeouts)\n",
                (unsigned long)mt6816_spi_fail_count);
     if (mt6816_spi_fail_count != 0U)

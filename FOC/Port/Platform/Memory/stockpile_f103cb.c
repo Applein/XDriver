@@ -24,6 +24,29 @@ Stockpile_FLASH_Typedef	stockpile_app_firmware	= {STOCKPILE_APP_FIRMWARE_ADDR, S
 Stockpile_FLASH_Typedef	stockpile_quick_cali		= {STOCKPILE_APP_CALI_ADDR, 		STOCKPILE_APP_CALI_SIZE,			(STOCKPILE_APP_CALI_SIZE / Stockpile_Page_Size),			0};
 Stockpile_FLASH_Typedef stockpile_data					= {STOCKPILE_APP_DATA_ADDR,			STOCKPILE_APP_DATA_SIZE, 			(STOCKPILE_APP_DATA_SIZE / Stockpile_Page_Size),			0};
 
+/*
+ * 警告: 不要用 stockpile_data !
+ *
+ * STOCKPILE_APP_DATA_ADDR (0x0801FC00) 与 emulated_eeprom 使用的
+ * FLASH_BASE_ADDRESS (FLASH_END + 1 - 1KB) 是【同一个物理页】。
+ *
+ * 本工程用 emulated_eeprom 存 BoardConfig_t (eeprom_put_blob)。
+ * 一旦有人调用 Stockpile_Flash_Data_Empty(&stockpile_data), 整个配置页
+ * 会被擦成 0xFF, 表现就是重启后配置莫名其妙回到默认值, 而且没有任何报错。
+ *
+ * 若将来确实需要用 stockpile 分区存别的东西, 必须先:
+ *   1. 把 STOCKPILE_APP_DATA_ADDR 挪到另一页 (并同步 STM32F103xx_FLASH.ld
+ *      里代码区上限 0x17C00), 或者
+ *   2. 彻底弃用 emulated_eeprom, 统一改成 stockpile_data
+ * 两者只能留一个。
+ *
+ * 下面这个断言把"当前确实共用一页"这个事实固化成编译期检查:
+ * 一旦哪天有人挪了地址, 编译会失败, 提醒他回来同步 eeprom_interface 的布局。
+ */
+_Static_assert(STOCKPILE_APP_DATA_ADDR == 0x0801FC00U,
+               "stockpile_data page moved: also update emulated_eeprom "
+               "FLASH_BASE_ADDRESS (and the FLASH LENGTH in the linker script)");
+
 /**
   * @brief  Flash数据清空
   * @param  stockpile	Flash分区表实例

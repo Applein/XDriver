@@ -23,9 +23,14 @@ FOC 控制算法移植自
 ### 编译
 
 ```bash
-cmake --preset Debug          # 配置
-cmake --build --preset Debug   # 编译
+cmake --preset Debug            # 配置（-O0，调试用）
+cmake --build --preset Debug     # 编译
+
+cmake --preset Release           # 也可：-Os，体积小约 17 KB
+cmake --build --preset Release
 ```
+
+两个预设都验证过可构建：Debug `58.5 KB`、Release `41.4 KB`（均为 95 KB 代码区）。
 
 产物：`build/Debug/XDriver.elf`（HEX/BIN 用 `arm-none-eabi-objcopy`，
 或直接用 VS Code 任务 **Build + HEX/BIN**）。
@@ -170,6 +175,7 @@ msh > xdrv cur 300         # 300 mA 力矩
 | 字段 | 含义 | 健康值 |
 |---|---|---|
 | `isr` | 20 kHz 中断的耗时（`last` 上次 / `max` 峰值 / `n` 次数） | `max` < 3240 周期（45 µs） |
+| `isr_warn` | **仅当超期时出现**：超过 45 µs 的次数与峰值 | 不出现 |
 | `spi_err` | MT6816 SPI 超时累计次数 | 不再增长（偶发 1~2 次可自愈） |
 | `spi_fail` | 失败分类 + 出错瞬间寄存器快照（仅 `spi_err ≠ 0` 时显示） | — |
 | `uart` | 控制台 `ore`（接收溢出）/ `err`（噪声·帧错·奇偶错） | 均为 0 |
