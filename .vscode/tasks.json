@@ -61,6 +61,24 @@
             "problemMatcher": [
                 "$gcc"
             ]
+        },
+        {
+            "label": "Post-CubeMX Patch",
+            "type": "shell",
+            "command": "powershell -ExecutionPolicy Bypass -File tools\\post_cubemx_patch.ps1",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Post-CubeMX Patch (check only)",
+            "type": "shell",
+            "command": "powershell -ExecutionPolicy Bypass -File tools\\post_cubemx_patch.ps1 -Check",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
         }
     ]
 }

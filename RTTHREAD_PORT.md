@@ -94,21 +94,58 @@ MSH_CMD_EXPORT(my_cmd, my test command);
 - 注意：`syscalls.c` 的 `_sbrk()` 起点也在 `__bss_end` 附近，**不要混用 newlib `malloc`
   和 `rt_malloc`**，统一使用 RT-Thread 的 `rt_malloc/rt_free`。
 
-## 6. 重新用 CubeMX 生成代码后必须检查
+## 6. 用 CubeMX 重新生成代码之后
 
-CubeMX 会覆盖以下内容，需要重新应用：
+CubeMX 会覆盖 `USER CODE` 区之外的所有内容。生成完执行一次：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\post_cubemx_patch.ps1
+```
+
+或按 `Ctrl+Shift+P` → `Tasks: Run Task` → **Post-CubeMX Patch**。
+脚本是幂等的（可反复运行），会用 `[FIXED]` / `[OK]` / `[WARN]` 报告每一项。
+只想看会改什么而不写文件：加 `-Check`。
+
+脚本自动检测 `startup_*.s` 与 `*.ld` 文件名，因此更换 MCU 型号也能用。
+
+### 脚本会做的 5 件事
+
+1. `startup_*.s`：`Reset_Handler` 里 `bl main` → `bl entry`。
+2. `*.ld`：补回 `.rti_fn`（组件自动初始化表）、`.fsymtab`（msh 命令表）、
+   `.vsymtab`（变量符号表）三个输出段，并 `KEEP` 防止被 `--gc-sections` 丢弃。
+3. `Core/Src/stm32f1xx_it.c`：
+   - 删除 `HardFault_Handler`、`PendSV_Handler`（由 RT-Thread 的
+     `libcpu/arm/cortex-m3/context_gcc.S` 提供，重复定义会链接失败）；
+   - `SysTick_Handler` 内加入 `rt_interrupt_enter(); rt_tick_increase(); rt_interrupt_leave();`；
+   - `USART1_IRQHandler` 内把 `HAL_UART_IRQHandler(&huart1);` 换成 `rt_hw_console_isr();`；
+   - 补上 `#include <rtthread.h>` 与 `#include "rt_board.h"`。
+4. `Core/Src/main.c`：
+   - `MX_GPIO_Init` / `MX_DMA_Init` / `MX_USART1_UART_Init` 去掉 `static`
+     （`rt_board.c` 要调用）；
+   - 从 `main()` 里删除 `HAL_Init()` / `SystemClock_Config()` / `MX_*_Init()`
+     （已在 `rt_hw_board_init()` 中完成，重复初始化会重置外设）。
+5. `CMakeLists.txt`：补回 `include(cmake/rtthread.cmake)`。
+
+### 脚本不会处理、需要你自己确认的
+
+- 若在 CubeMX 中**改掉了 USART1**（换实例、关掉、改引脚），需要同步修改
+  `Core/Src/rt_board.c` 里的 `CONSOLE_*` 宏与 `rt_hw_console_isr()`。
+- 若关闭了 USART1 的 NVIC 中断，`rt_hw_board_init()` 里的 `HAL_NVIC_EnableIRQ` 仍会打开它。
+- 不要在 CubeMX 里勾选 `Generate peripheral initialization as a pair of .c/.h files`，
+  否则 `MX_*_Init` 会被移到别的文件，脚本的正则匹配不到（届时手动去 `static` 即可）。
+- `rtconfig.h`、`cmake/rtthread.cmake`、`Core/Src/rt_board.c`、`Core/Inc/rt_board.h`
+  是集成自有文件，CubeMX 不会动它们。
+
+### 手动操作清单（脚本不可用时）
 
 1. `startup_stm32f103xb.s`：`bl main` 改回 `bl entry`。
 2. `STM32F103xx_FLASH.ld`：确认 `.rti_fn` / `.fsymtab` / `.vsymtab` 三个输出段仍存在。
-3. `Core/Src/stm32f1xx_it.c`：
-   - 删除 `HardFault_Handler` 与 `PendSV_Handler`（RT-Thread 提供）；
-   - `SysTick_Handler` 中加入 `rt_interrupt_enter(); rt_tick_increase(); rt_interrupt_leave();`；
-   - `USART1_IRQHandler` 改为调用 `rt_hw_console_isr();`（不要调用 `HAL_UART_IRQHandler`）。
-4. `Core/Src/main.c`：
-   - `MX_GPIO_Init` / `MX_DMA_Init` / `MX_USART1_UART_Init` 去掉 `static`（`rt_board.c` 要调用）；
-   - 保留 `USER CODE` 区内的 `hello` 命令，`main()` 中不要再做 HAL/时钟初始化。
+3. `Core/Src/stm32f1xx_it.c`：删 `HardFault_Handler`、`PendSV_Handler`；
+   `SysTick_Handler` 加 `rt_tick_increase()`；`USART1_IRQHandler` 改调 `rt_hw_console_isr()`。
+4. `Core/Src/main.c`：`MX_*_Init` 去 `static`；`main()` 中的 HAL/时钟/外设初始化删掉。
 5. `Core/Src/stm32f1xx_hal_msp.c`：PB7 的 `GPIO_NOPULL` 可保留，
    `rt_hw_board_init()` 会重新配置为 `GPIO_PULLUP`。
+
 
 ## 7. 构建与烧录
 
