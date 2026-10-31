@@ -547,20 +547,47 @@ static const char *foc_mode_name(MotorMode mode)
 }
 
 /*
- * 功率级状态。state 的 STOP 有三个不同原因, 这一行把它们分开:
- *   asleep   soft_disable 生效 (off), 线圈断开, 轴可自由转动
- *   brake    soft_brake  生效 (brake), 线圈短路, 轴变硬
- *   active   其它情况: 要么有控制环在跑, 要么还在归零途中
+ * 功率级状态
+ *
+ * 判定顺序严格照抄 motor.c 里 CloseLoopControlTick() 的 Ctrl Loop 分支,
+ * 这样 power 与 state 永远不会有矛盾的说法:
+ *
+ *     if (is_stalled || soft_disable || !calibrated)  driver_sleep();
+ *     else if (soft_brake)                            driver_brake();
+ *     else switch (mode_running) {
+ *          case MOTOR_MODE_STOP:                      driver_sleep();
+ *          ...
+ *     }
+ *
+ * 之所以按这个顺序: 只要前面任一条件成立, 后面的分支根本不会执行,
+ * 所以"真正决定功率级状态"的永远是第一个命中的条件。
+ *
+ * 特别是 mode_running == MOTOR_MODE_STOP 的情况 —— Button 1 单击停止就是
+ * 走这条路 (只切 idle, 不置 soft_disable), 此时功率级确实每 tick 都在
+ * driver_sleep(), 因此必须报 asleep; 早期版本在这里报 "active",
+ * 导致 state 显示 STOP 而 power 显示 active, 看起来自相矛盾。
  */
-static const char *foc_power_name(MotionController *c)
+static const char *foc_power_name(MotionController *c, bool calibrated)
 {
+    if (!calibrated)
+    {
+        return "asleep (no calib)";
+    }
+    if (c->is_stalled)
+    {
+        return "asleep (stall)";
+    }
     if (c->soft_disable)
     {
-        return "asleep (coils open)";
+        return "asleep (disabled)";
     }
     if (c->soft_brake)
     {
         return "brake (coils shorted)";
+    }
+    if (c->mode_running == MOTOR_MODE_STOP)
+    {
+        return "asleep (idle)";
     }
 
     return "active";
@@ -583,6 +610,7 @@ static const char *foc_state_name(MotorState state)
 static void foc_cmd_status(int argc, char **argv)
 {
     MotionController *c = motor.controller;
+    bool calibrated = encoder_is_calibrated(motor.encoder);
     int32_t pos_mrev;
     int32_t vel_mrps;
 
@@ -594,7 +622,7 @@ static void foc_cmd_status(int argc, char **argv)
     vel_mrps = (int32_t)(((int64_t)c->est_velocity * 1000) / MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS);
 
     rt_kprintf("state   : %s\n", foc_state_name(c->state));
-    rt_kprintf("power   : %s\n", foc_power_name(c));
+    rt_kprintf("power   : %s\n", foc_power_name(c, calibrated));
 
     /* request 与 running 通常一致 (20kHz 一个周期内就会同步);
      * 只有切换瞬间才不同, 那种情况下附在后面, 避免稳态输出噪声。 */
@@ -611,7 +639,7 @@ static void foc_cmd_status(int argc, char **argv)
     rt_kprintf("pos     : %d (mrev)\n", pos_mrev);
     rt_kprintf("vel     : %d (mrev/s)\n", vel_mrps);
     rt_kprintf("current : %d (mA)\n", c->foc_current);
-    rt_kprintf("calib   : %s\n", encoder_is_calibrated(motor.encoder) ? "yes" : "NO");
+    rt_kprintf("calib   : %s\n", calibrated ? "yes" : "NO");
     rt_kprintf("stall   : %d, overload %d\n", (int)c->is_stalled, (int)c->overload_flag);
     rt_kprintf("cfg     : node=%u limit=%dmA vel=%d acc=%d\n",
                (unsigned)boardConfig.can_node_id, (int)boardConfig.current_limit,

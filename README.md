@@ -143,6 +143,120 @@ msh > xdrv cur 300         # 300 mA 力矩
 > 带负载会导致采样不连续而失败。失败时重启后 `xdrv` 仍显示 `calib: NO`，
 > 且 `stall` 字段为 `1`（上游用它标记校准失败），Flash 校准区会被清空。
 
+### 状态字段说明
+
+`xdrv` 输出的每一行含义，以及三个容易混淆的字段：
+
+| 字段 | 回答的问题 | 取值 |
+|---|---|---|
+| `state` | 闭环**实际**状态 | `STOP` / `FINISH` / `RUNNING` / `OVERLOAD` / `STALL` / `NO_CALIB` |
+| `power` | 功率级**实际**状态（按闭环分支顺序推导，必与 `state` 一致） | `active` / `asleep (no calib)` / `asleep (stall)` / `asleep (disabled)` / `asleep (idle)` / `brake (coils shorted)` |
+| `mode` | 哪个控制环在跑 | `idle` / `pos` / `vel` / `cur` / `traj` / … |
+
+- **`STOP` 与 `idle` 不是同一件事**：`mode: idle` 表示"没有控制环"，
+  `state: STOP` 表示"功率级已关断"。早期版本两者都显示 `stop`，已改名区分。- **`power` 与 `state` 不会矛盾**：`power` 的判定顺序严格照抄闭环的 `if/else` 链
+  （`!calib` → `stall` → `disabled` → `brake` → `idle` → 否则 `active`），
+  因此 `state: STOP` 时 `power` 必然是某种 `asleep`/`brake`，不会是 `active`。- **`OVERLOAD`**：闭环输出被限幅在 `cfg.limit` 上持续 1 秒。
+  常见于加速度需求超过限流（例如目标距离很远时仍全速加速），
+  电流一回落会自动清除。纯电流模式（`xdrv cur`）不报此状态。
+- **`STALL`**：电流满幅且转速接近 0 持续 1 秒，且仅当
+  `enable_stall_protect` 打开才检测（默认关闭）。它是**粘滞标志**，
+  触发后闭环会 `driver_sleep()`，必须手动清除：`xdrv on` 或单击 Button 2。
+
+### 诊断字段
+
+`xdrv` 末尾三行用于判断实时性和通信健康，正常时后两项不增长：
+
+| 字段 | 含义 | 健康值 |
+|---|---|---|
+| `isr` | 20 kHz 中断的耗时（`last` 上次 / `max` 峰值 / `n` 次数） | `max` < 3240 周期（45 µs） |
+| `spi_err` | MT6816 SPI 超时累计次数 | 不再增长（偶发 1~2 次可自愈） |
+| `spi_fail` | 失败分类 + 出错瞬间寄存器快照（仅 `spi_err ≠ 0` 时显示） | — |
+| `uart` | 控制台 `ore`（接收溢出）/ `err`（噪声·帧错·奇偶错） | 均为 0 |
+
+若 `spi_fail` 中出现 `sr=0x0000` 且 `rxne` 增长，说明 SPI 外设曾完全停摆
+（OVR/MODF 锁死），固件会在超时后自动复位 SPI 恢复。
+
+---
+
+## 按键功能
+
+板载两个按键，**均为低电平有效**（内部上拉，按下为 0）。
+扫描在 100 Hz 家务线程（`foc_hk`，每 10 ms 采样一次）里完成。
+两个按键配合可在**没有串口**的情况下完成启停、归零与校准。
+
+| | Button 1 | Button 2 |
+|---|---|---|
+| 引脚 | **PB12** | **PB2** |
+| 上拉 | 内部上拉 | 内部上拉 |
+| 极性 | 低电平有效 | 低电平有效 |
+| 长按阈值 | **1 s** | **3 s** |
+
+### Button 1（PB12）—— 启停开关
+
+| 动作 | 行为 |
+|---|---|
+| **单击** | 运行 ↔ 停止 切换 |
+| **长按 1 s** | **系统复位**（`HAL_NVIC_SystemReset()`） |
+
+单击的细节：
+
+- 正在运行时按一下 → 记住当前模式到 `boardConfig.default_mode`，然后切到 `idle`
+- 已停止时按一下 → 恢复到刚才记住的模式继续运行
+
+因此**按一下停、再按一下接着跑**，不需要重新下设定点。
+
+> 注意：Button 1 的"停止"是把控制环切到 `idle`（功率级每 tick 调 `driver_sleep()`），
+> 它**不会**设置 `soft_disable`。因此 `xdrv` 会显示 `state: STOP` + `power: asleep (idle)`，
+> 而 `mode` 仍保留停机前的模式名（如 `vel`）—— 这正是“再按一下能恢复原模式”的实现方式。
+> 若需要彻底失能（清 `soft_disable`、轴可自由转动且允许 `xdrv cali`），请用 `xdrv off`。
+
+### Button 2（PB2）—— 回到零点 / 清堵转
+
+| 动作 | 行为 |
+|---|---|
+| **长按 3 s** | 把当前模式的设定点归零；**位置模式下即回到零点（home offset）** |
+| **单击** | 清除 `STALL` 堵转标志 |
+
+长按归零按当前模式分流：
+
+| 当前模式 | 长按 3 s 的效果 |
+|---|---|
+| `pos`（位置） | `SetPositionSetPoint(0)` → **运动回零点**（home offset 处） |
+| `vel`（速度） | `SetVelocitySetPoint(0)` → 减速到停 |
+| `cur`（电流） | `SetCurrentSetPoint(0)` → 力矩归零 |
+| `traj` / `step-dir` / `idle` | 无动作 |
+
+> 位置模式下的长按**会让电机转动**（一路跑回零点），不是"原地停止"。
+> 需要立即停住请用 Button 1 或 `xdrv off`。
+
+单击清堵转是 `is_stalled` 的手动清除入口之一（另一个是 `xdrv on`）。
+该标志之所以是粘滞的，是因为堵转后闭环会关断功率级，
+自动恢复可能在机械故障未排除时造成反复冲击。
+
+### 组合动作 —— 上电触发校准
+
+**上电初始化期间**（`foc_app_init()` 里延时 100 ms 之后）若**两个按键同时按住**，
+自动进入编码器校准，无需串口：
+
+```
+断电 -> 按住 Button1 + Button2 -> 上电 -> 保持按住约 1 秒 -> 松开
+```
+
+此后电机正转一圈、反转一圈，完成后自动复位重启。
+要求与 `xdrv cali` 相同：**空载、轴可自由转动**。
+
+### 与 msh 命令的对应关系
+
+| 按键动作 | 等价操作 |
+|---|---|
+| Button 1 单击（运行 → 停） | 切到 `idle`（≈ `xdrv off`，但不置 `soft_disable`） |
+| Button 1 单击（停 → 运行） | `xdrv on`（恢复 `default_mode`） |
+| Button 1 长按 1 s | 无对应命令（系统复位） |
+| Button 2 长按 3 s | `xdrv pos 0` / `xdrv vel 0` / `xdrv cur 0`（按当前模式） |
+| Button 2 单击 | `xdrv on` 附带的清堵转效果 |
+| 上电双键同按 | `xdrv cali` |
+
 ---
 
 ## 目录结构
@@ -219,7 +333,7 @@ Flash 擦除会暂停 CPU 取指 20~40 ms，期间 PWM 保持最后占空比 →
 ```
 msh > xdrv save
 refuse save: motor is active (mode=vel)
-        run 'xdrv mode stop' or 'xdrv off' first
+        run 'xdrv off' first
 ```
 
 ---
@@ -253,8 +367,9 @@ powershell -ExecutionPolicy Bypass -File tools\post_cubemx_patch.ps1
 |---|---|
 | CAN 协议 | CAN1 硬件与位时序已配置（1 Mbit/s），应用层协议未实现 |
 | ADC | 母线电压 / 驱动温度采样未启用（源工程里也未被读取） |
-| step-dir 模式 | 枚举值保留，未接入（PA6 现用于调试指示） |
-| MT6816 超时 | 读角度为**寄存器级有界实现**：等待上界 200 次循环（~28 µs），**并且失败后闩锁**（每 2048 次调用才重试一次），保证控制 ISR 永远不会占满 CPU。超时计入 `spi_err`，电机沿用上一次角度继续运行 |
+| step-dir 模式 | 枚举值与插补器保留，未接入引脚（PA6 现用于 1 Hz 存活指示；源工程中该功能亦未完成） |
+| 控制环占用 | 20 kHz ISR 实测 `max 37.5 µs / 50 µs` 周期（75%）。其中约 10.7 µs 是 MT6816 两次 16-bit SPI 传输，位置模式下另有少量软浮点运算（Cortex-M3 无 FPU）。若后续增加 CAN 解析等负载，需先把控制数学定点化 |
+| MT6816 读角度 | 寄存器级有界实现：等待上界 400 次循环（~33 µs）。失败后置闩锁（每 64 次调用才重试一次），并**自动复位 SPI 外设**（SPE 清零→读 SR/DR→重新使能）从 OVR/MODF 卡死中自愈。实测 260 万 tick 仅失败 1 次且不再增长 |
 | 配置版本 | 启动时做**合法性校验**（限流/限速/加速度/默认模式范围），不合法则自动恢复出厂值并回写 Flash —— 避免坏配置导致“不转 + 永久 OVERLOAD” |
 
 ---
