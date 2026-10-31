@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
+#include <rtthread.h>
+#include "rt_board.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,19 +48,14 @@ DMA_HandleTypeDef hdma_usart1_rx;
 /* USER CODE BEGIN PV */
 /* 测试用：记录 IO 翻转次数，方便调试时观察 */
 volatile uint32_t debug_1_toggle_cnt = 0;
-
-/* USART1 测试相关变量 */
-static uint8_t usart1_rx_byte = 0;           /* 中断接收用的单字节缓冲 */
-volatile uint32_t usart1_rx_cnt = 0;         /* 累计接收字节数 */
-volatile uint32_t usart1_last_byte = 0;      /* 最近一次收到的字节 */
-volatile uint32_t usart1_err_cnt = 0;        /* 串口错误计数 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_DMA_Init(void);
-static void MX_USART1_UART_Init(void);
+/* 这些初始化函数由 rt_board.c 的 rt_hw_board_init() 调用，故不能是 static */
+void MX_GPIO_Init(void);
+void MX_DMA_Init(void);
+void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -67,102 +63,27 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 /*
- * printf 重定向：printf() -> USART1
- * 说明：syscalls.c 中的 _write() 会调用 __io_putchar()，这里实现它即可。
- *       使用阻塞发送，简单可靠，适合调试输出。
+ * 板级初始化 (HAL / 时钟 / GPIO / USART1 / 堆 / OS tick) 已移到
+ * Core/Src/rt_board.c 的 rt_hw_board_init() 中，由 rtthread_startup() 调用。
+ * main() 现在运行在 RT-Thread 的 main 线程里。
+ *
+ * 控制台: USART1 (PB6=TX / PB7=RX, 115200 8N1)
+ *         在串口终端里输入 help 查看 FinSH/msh 命令。
  */
-int __io_putchar(int ch)
-{
-  uint8_t c = (uint8_t)ch;
-  HAL_UART_Transmit(&huart1, &c, 1, HAL_MAX_DELAY);
-  return ch;
-}
 
-/* 启动 USART1 单字节中断接收（用于回显测试） */
-static void USART1_StartRxIT(void)
+/* FinSH 测试命令: msh 中输入 hello [name] */
+static void hello(int argc, char **argv)
 {
-  HAL_UART_Receive_IT(&huart1, &usart1_rx_byte, 1);
-}
-
-/* USART1 接收完成回调：回显收到的字节，并重新开启下一次接收 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
+  if (argc > 1)
   {
-    usart1_rx_cnt++;
-    usart1_last_byte = usart1_rx_byte;
-
-    /* 回显：原样发回 PC */
-    HAL_UART_Transmit(&huart1, &usart1_rx_byte, 1, 10);
-
-    /* 重新开启下一字节接收 */
-    HAL_UART_Receive_IT(&huart1, &usart1_rx_byte, 1);
+    rt_kprintf("Hello, %s! (RT-Thread FinSH works)\n", argv[1]);
+  }
+  else
+  {
+    rt_kprintf("Hello RT-Thread on XDriver!\n");
   }
 }
-
-/* USART1 错误回调：清除错误标志并重新开启接收，避免接收停摆 */
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
-  {
-    usart1_err_cnt++;
-    __HAL_UART_CLEAR_OREFLAG(huart);
-    __HAL_UART_CLEAR_FEFLAG(huart);
-    __HAL_UART_CLEAR_NEFLAG(huart);
-    HAL_UART_Receive_IT(&huart1, &usart1_rx_byte, 1);
-  }
-}
-
-/*
- * USART1 测试主函数（在 while(1) 中周期调用）
- * 测试内容：
- *   1. 启动时用 printf 打印横幅和串口配置
- *   2. 每秒 printf 一次运行信息（验证 TX 阻塞发送）
- *   3. 每 3 秒用 DMA 发送一段字符串（验证 DMA TX）
- *   4. 收到任意字符原样回显（验证 RX 中断接收）
- */
-static void USART1_Test(void)
-{
-  static uint32_t last_tick = 0;
-  static uint32_t cnt = 0;
-  static const uint8_t dma_msg[] = "USART1 DMA TX test OK\r\n";
-  uint32_t now = HAL_GetTick();
-
-  /* 1) 上电初始化一次 */
-  if (cnt == 0U)
-  {
-    printf("\r\n===== USART1 Test Start =====\r\n");
-    printf("USART1: PB6(TX) / PB7(RX), 115200 8N1, remap ON\r\n");
-    printf("Send any character, it will be echoed back.\r\n");
-    printf("==============================\r\n");
-    USART1_StartRxIT();
-    last_tick = now;
-  }
-
-  /* 2) 每 1s 用 printf 打印一次状态 */
-  if ((now - last_tick) >= 1000U)
-  {
-    last_tick = now;
-    cnt++;
-
-    printf("[%lu] printf OK, tick=%lu, rx_cnt=%lu, last=0x%02lX, err=%lu\r\n",
-           (unsigned long)cnt,
-           (unsigned long)now,
-           (unsigned long)usart1_rx_cnt,
-           (unsigned long)usart1_last_byte,
-           (unsigned long)usart1_err_cnt);
-
-    /* 3) 每 3s 用 DMA 方式发送一段字符串 */
-    if ((cnt % 3U) == 0U)
-    {
-      /* 等待上一次发送完成，避免与 printf 抢占 TX */
-      if (huart1.gState == HAL_UART_STATE_READY)
-      {
-        HAL_UART_Transmit_DMA(&huart1, (uint8_t *)dma_msg, sizeof(dma_msg) - 1U);
-      }
-    }
-  }
-}
+MSH_CMD_EXPORT(hello, say hello);
 /* USER CODE END 0 */
 
 /**
@@ -176,32 +97,9 @@ int main(void)
 
   /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
-  SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_DMA_Init();
-  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* 测试开始前先把 PA6 置为已知状态（低电平） */
-  HAL_GPIO_WritePin(debug_1_GPIO_Port, debug_1_Pin, GPIO_PIN_RESET);
-
-  /* 启动 USART1 测试（打印横幅 + 开启中断接收） */
-  USART1_Test();
+  /* 注意: HAL/时钟/外设/堆/OS tick 已在 rt_hw_board_init() 中完成,
+     控制台是 USART1 (PB6=TX / PB7=RX, 115200 8N1), 在终端输入 help 查看 msh 命令 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -211,28 +109,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* USART1 测试：每秒 printf 一次状态，每 3 秒 DMA 发送一次 */
-    USART1_Test();
-
     /* PA6 每 500ms 翻转一次 -> 周期 1s，即 1Hz 方波
        - 用万用表/示波器测 PA6，应能看到 1Hz 方波
        - 或接 LED+限流电阻（PA6 -> 1k -> LED -> GND），LED 1秒闪烁一次 */
     HAL_GPIO_TogglePin(debug_1_GPIO_Port, debug_1_Pin);
     debug_1_toggle_cnt++;
 
-    /* 每个周期读取一次输出电平，验证读写一致（仅调试用，可在观察窗口查看） */
-    if (HAL_GPIO_ReadPin(debug_1_GPIO_Port, debug_1_Pin) == GPIO_PIN_SET)
-    {
-      /* PA6 当前为高电平：可在此加断点或置标志位 */
-      __NOP();
-    }
-    else
-    {
-      /* PA6 当前为低电平 */
-      __NOP();
-    }
-
-    HAL_Delay(500);
+    rt_thread_mdelay(500);
   }
   /* USER CODE END 3 */
 }
@@ -281,7 +164,7 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
-static void MX_USART1_UART_Init(void)
+void MX_USART1_UART_Init(void)
 {
 
   /* USER CODE BEGIN USART1_Init 0 */
@@ -312,7 +195,7 @@ static void MX_USART1_UART_Init(void)
 /**
   * Enable DMA controller clock
   */
-static void MX_DMA_Init(void)
+void MX_DMA_Init(void)
 {
 
   /* DMA controller clock enable */
@@ -333,7 +216,7 @@ static void MX_DMA_Init(void)
   * @param None
   * @retval None
   */
-static void MX_GPIO_Init(void)
+void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */

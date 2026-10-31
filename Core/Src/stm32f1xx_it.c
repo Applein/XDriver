@@ -22,6 +22,9 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <rthw.h>
+#include <rtthread.h>
+#include "rt_board.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -83,19 +86,11 @@ void NMI_Handler(void)
 }
 
 /**
-  * @brief This function handles Hard fault interrupt.
+  * @brief HardFault_Handler is provided by RT-Thread
+  *        (RT-Thread/libcpu/arm/cortex-m3/context_gcc.S), which prints
+  *        register/stack information through the console.
+  *        Do not define it here, otherwise the linker reports a duplicate.
   */
-void HardFault_Handler(void)
-{
-  /* USER CODE BEGIN HardFault_IRQn 0 */
-
-  /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
-}
 
 /**
   * @brief This function handles Memory management fault.
@@ -169,25 +164,22 @@ void DebugMon_Handler(void)
 }
 
 /**
-  * @brief This function handles Pendable request for system service.
+  * @brief PendSV_Handler is provided by RT-Thread
+  *        (RT-Thread/libcpu/arm/cortex-m3/context_gcc.S) and performs the
+  *        actual thread context switch. Do not define it here.
   */
-void PendSV_Handler(void)
-{
-  /* USER CODE BEGIN PendSV_IRQn 0 */
-
-  /* USER CODE END PendSV_IRQn 0 */
-  /* USER CODE BEGIN PendSV_IRQn 1 */
-
-  /* USER CODE END PendSV_IRQn 1 */
-}
 
 /**
   * @brief This function handles System tick timer.
+  * @note  SysTick is used as the RT-Thread OS tick. The HAL time base uses
+  *        TIM1 (see stm32f1xx_hal_timebase_tim.c), so both can coexist.
   */
 void SysTick_Handler(void)
 {
   /* USER CODE BEGIN SysTick_IRQn 0 */
-
+  rt_interrupt_enter();
+  rt_tick_increase();
+  rt_interrupt_leave();
   /* USER CODE END SysTick_IRQn 0 */
 
   /* USER CODE BEGIN SysTick_IRQn 1 */
@@ -246,13 +238,18 @@ void TIM1_UP_IRQHandler(void)
 
 /**
   * @brief This function handles USART1 global interrupt.
+  * @note  Must be a STRONG definition: startup_stm32f103xb.s also has a weak
+  *        USART1_IRQHandler. If both were weak, the linker would pick
+  *        Default_Handler and FinSH input would never work.
   */
 void USART1_IRQHandler(void)
 {
   /* USER CODE BEGIN USART1_IRQn 0 */
-
+  /* Direct register ISR (RX ring buffer for the FinSH console). */
+  rt_interrupt_enter();
+  rt_hw_console_isr();
+  rt_interrupt_leave();
   /* USER CODE END USART1_IRQn 0 */
-  HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */
 
   /* USER CODE END USART1_IRQn 1 */

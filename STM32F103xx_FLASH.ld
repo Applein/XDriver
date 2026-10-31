@@ -94,6 +94,36 @@ SECTIONS
     _etext = .;        /* define a global symbols at end of code */
   } >FLASH
 
+  /* RT-Thread: component auto-initialization table (INIT_BOARD_EXPORT, ...) */
+  .rti_fn :
+  {
+    . = ALIGN(4);
+    __rt_init_start = .;
+    KEEP(*(SORT(.rti_fn.*)))
+    __rt_init_end = .;
+    . = ALIGN(4);
+  } >FLASH
+
+  /* RT-Thread FinSH: msh command table (MSH_CMD_EXPORT) */
+  .fsymtab :
+  {
+    . = ALIGN(4);
+    __fsymtab_start = .;
+    KEEP(*(FSymTab))
+    __fsymtab_end = .;
+    . = ALIGN(4);
+  } >FLASH
+
+  /* RT-Thread FinSH: variable symbol table (FINSH_FUNCTION_EXPORT) */
+  .vsymtab :
+  {
+    . = ALIGN(4);
+    __vsymtab_start = .;
+    KEEP(*(VSymTab))
+    __vsymtab_end = .;
+    . = ALIGN(4);
+  } >FLASH
+
   /* Constant data goes into FLASH */
   .rodata :
   {

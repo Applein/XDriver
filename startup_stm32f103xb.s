@@ -96,8 +96,8 @@ LoopFillZerobss:
 
 /* Call static constructors */
     bl __libc_init_array
-/* Call the application's entry point.*/
-  bl main
+/* Call the RT-Thread entry point (components.c: entry -> rtthread_startup). */
+  bl entry
   bx lr
 .size Reset_Handler, .-Reset_Handler
 
