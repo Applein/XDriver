@@ -167,7 +167,7 @@ arm-none-eabi-gcc <同上 flags> \
 | 校准器 Port | `Port/encoder_calibrator_stm32.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
 | 存储层 | `Port/Platform/Memory/{stockpile_f103cb.c, emulated_eeprom.c, eeprom_interface.c}` | ✅ 完成，已入 `FOC_SRC` |
 | 应用层 | `UserApp/app_foc.{h,c}` + `configurations.h` | ✅ 完成，已入 `FOC_SRC` |
-| CAN 协议 | `UserApp/protocols/interface_can.c` | ⬜ 第二阶段 |
+| CAN 协议 | `UserApp/protocols/interface_can.{h,c}` | ✅ 完成，已入 `FOC_SRC` |
 
 ### 阶段 C 已完成项
 
@@ -203,6 +203,56 @@ arm-none-eabi-gcc <同上 flags> \
 改命令名只需改 `app_foc.c` 里的 `FOC_CMD_NAME` 宏 + 末尾
 `MSH_CMD_EXPORT_ALIAS` 的字面量（finsh 的宏会先字符串化参数，宏不会展开）。
 
+### CAN 协议：`interface_can.c`
+
+上游 `OnCanCmd()` 在 CAN 接收中断里直接执行、直接复用 `RxData` 当应答缓冲。
+本工程改为两段式：
+
+```
+USB_LP_CAN1_RX0_IRQHandler (优先级 3)
+  └ HAL_CAN_IRQHandler → HAL_CAN_RxFifo0MsgPendingCallback
+      ├ rt_interrupt_enter()                      ← 必须显式调用
+      ├ 循环 HAL_CAN_GetRxMessage 取空 FIFO0
+      ├ 帧拷进 8 深环形队列 (DLC 之后的字节清零)
+      ├ rt_sem_release
+      └ rt_interrupt_leave()
+
+can 线程 (优先级 14, 静态栈 768 B)
+  └ 每帧: 节点号过滤 (0 = 广播) → can_protocol_on_cmd()
+      ├ 改 controller / motion_planner 的几行在临界区内
+      └ 应答 HAL_CAN_AddTxMessage 在临界区外 (它依赖 HAL_GetTick,
+         关中断时 tick 不前进会死等)
+```
+
+**帧格式**（与上游一致）：`StdId = (节点号 << 7) | 命令号`，节点号 4 bit、命令 7 bit，
+数据 8 字节，浮点按小端 `memcpy` 收发。
+
+| 命令 | 作用 | 应答 |
+|---|---|---|
+| `0x01` | 使能：数据=1 → 速度模式，其它 → 停止 | — |
+| `0x02` | 触发编码器校准 | — |
+| `0x03` | 电流设定值（A） | — |
+| `0x04` | 速度设定值（r/s） | — |
+| `0x05` | 位置设定值（r），`data[4]≠0` 时应答 | `0x23` |
+| `0x06` | 位置 + 时间（r, s） | `0x23` |
+| `0x07` | 位置 + 限速（r, r/s） | 总是 `0x23` |
+| `0x11`~`0x1B` | 节点号 / 限流 / 限速 / 加速度 / 零点 / 自使能 / DCE 增益 / 堵转保护 | — |
+| `0x21`/`0x22`/`0x23`/`0x24` | 查询电流 / 速度 / 位置 / 零点偏移 | 同命令号 |
+| `0x7E` | 擦除配置（写 Flash 后复位） | — |
+| `0x7F` | 复位 | — |
+
+与上游的行为差异（均为适配 RTOS，已在源码注释说明）：
+
+1. **发送失败计数**（`txfail`）而不是 `Error_Handler()` 死机。
+2. **短帧尾部清零**：上游读 `data[4]` 时短帧会读到上一条帧的残留。
+3. **`0x11`~`0x1B` / `0x7E` 的落盘延迟到电机停机**：`CONFIG_COMMIT` /
+   `CONFIG_RESTORE` 只置标志，由 100 Hz 线程在 `mode_running == STOP` 或
+   `soft_disable` 时才真正擦写（见下方 Flash 写入保护）。
+4. **`0x01`/`0x03`~`0x07` 顺手清 `soft_disable`/`soft_brake`**：
+   本工程的 `off`/`brake` 走这两个标志，不清掉会出现“命令生效但电机不动”。
+
+诊断：`xdrv status` 末行 `can : rx / cmd / other / drop / txfail`。
+
 ### Flash 写入保护
 
 写 Flash 会暂停 CPU 的 Flash 取指 20~40 ms，期间 20 kHz 中断被推迟，
@@ -213,6 +263,7 @@ PWM 保持最后比较值 → 电机以旧力矩继续推。因此三个命令�
 | `xdrv cali` | `foc_flash_write_allowed()`：`mode_running == STOP` 或 `soft_disable`（即先 `off`） |
 | `xdrv home` | `foc_flash_write_allowed()`：`mode_running == STOP` 或 `soft_disable` |
 | `xdrv save` | 同上 |
+| CAN `0x11`~`0x1B` / `0x7E` | 100 Hz 线程在写之前再检查一次（`mode_running == STOP` 或 `soft_disable`），否则**保持标志等待**，不会在电机出力时擦 Flash |
 
 不满足时打印 `refuse <cmd>: motor is active (mode=...)` 并提示先
 `xdrv mode stop` 或 `xdrv off`。
@@ -266,7 +317,7 @@ FOC/
                   stockpile_config.h  stockpile_f103cb.{h,c}
       Utils/      st_hardware.{h,c}
   UserApp/        app_foc.{h,c}  common_inc.h  configurations.h
-    protocols/    interface_can.{h,c}   (第二阶段, 尚未创建)
+    protocols/    interface_can.{h,c}
   docs/           FOC_C_PORT.md
 ```
 

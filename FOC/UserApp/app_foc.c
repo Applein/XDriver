@@ -48,6 +48,8 @@
 #include "Platform/Memory/eeprom_interface.h"
 #include "Platform/Utils/st_hardware.h"
 
+#include "protocols/interface_can.h"
+
 /* ========================================================================== */
 /* 全局对象 (对应上游 main.cpp 的 Component Definitions)                       */
 /* ========================================================================== */
@@ -324,20 +326,30 @@ static void foc_housekeeping_entry(void *parameter)
          * 该函数只在 CALI_STATE_CALCULATING 时才真正干活 (会写 Flash) */
         encoder_calibrator_tick_main_loop(&encoderCalibrator);
 
-        /* 上游 main() 的 for(;;) 里: CONFIG_COMMIT / CONFIG_RESTORE 处理 */
-        if (boardConfig.config_status == CONFIG_COMMIT)
+        /* 上游 main() 的 for(;;) 里: CONFIG_COMMIT / CONFIG_RESTORE 处理
+         *
+         * 与上游的差异: 上游是"设了标志就立刻写", 而 CAN 命令 (0x11~0x1B /
+         * 0x7E) 可能在电机正在出力时到达。一次页擦除会让 Flash 取指停顿
+         * 20~40ms, 期间 20 kHz 中断被推迟、PWM 保持最后一次比较值, 电机以
+         * 旧力矩继续推。因此这里延迟到电机停机 (mode STOP 或 disable) 再落盘,
+         * 标志保持不变, 下次进本线程继续尝试。 */
+        if ((boardConfig.config_status == CONFIG_COMMIT) ||
+            (boardConfig.config_status == CONFIG_RESTORE))
         {
-            boardConfig.config_status = CONFIG_OK;
-            eeprom_put_blob(0, &boardConfig, (uint16_t)sizeof(boardConfig));
-        }
-        else if (boardConfig.config_status == CONFIG_RESTORE)
-        {
-            eeprom_put_blob(0, &boardConfig, (uint16_t)sizeof(boardConfig));
-            HAL_NVIC_SystemReset();
-        }
-        else
-        {
-            /* nothing */
+            if ((motor.controller->mode_running == MOTOR_MODE_STOP) ||
+                motor.controller->soft_disable)
+            {
+                if (boardConfig.config_status == CONFIG_COMMIT)
+                {
+                    boardConfig.config_status = CONFIG_OK;
+                    eeprom_put_blob(0, &boardConfig, (uint16_t)sizeof(boardConfig));
+                }
+                else
+                {
+                    eeprom_put_blob(0, &boardConfig, (uint16_t)sizeof(boardConfig));
+                    HAL_NVIC_SystemReset();
+                }
+            }
         }
 
         rt_thread_mdelay(FOC_HOUSEKEEPING_PERIOD_MS);
@@ -480,7 +492,17 @@ void foc_app_init(void)
                    FOC_HOUSEKEEPING_PRIORITY, 10);
     rt_thread_startup(&foc_housekeeping_thread);
 
-    /* ---------- 10. 最后启动 20 kHz 闭环 (上游: HAL_TIM_Base_Start_IT(&htim4)) ---------- */
+    /* ---------- 10. CAN 协议 (线程 + 命令处理) ---------- */
+    /*
+     * 上游在 MX_CAN_Init 的 USER CODE 2 里就配好过滤器并启动 CAN;
+     * 本工程的 MX_CAN_Init() 在 rt_hw_board_init() 里调用, 早于 Flash 配置载入。
+     * 过滤器是全通的 (节点号靠软件比对), 所以放到这里启动没有副作用,
+     * 但能保证 can_protocol 线程看到的是已经载入好的 boardConfig。
+     */
+    can_protocol_init(&motor, &encoderCalibrator);
+
+    /* ---------- 11. 最后启动 20 kHz 闭环 ---------- */
+    /* 上游: HAL_TIM_Base_Start_IT(&htim4) */
 #if FOC_AUTOSTART_20KHZ
     HAL_TIM_Base_Start_IT(&htim4);
 #else
@@ -738,6 +760,22 @@ static void foc_cmd_status(int argc, char **argv)
     rt_kprintf("uart    : ore=%lu err=%lu  (rx lost if growing)\n",
                (unsigned long)console_err_ore,
                (unsigned long)console_err_other);
+
+    /*
+     * CAN 诊断:
+     *   rx     收到帧数 (中断里计数, 含被节点号过滤掉的)
+     *   cmd    真正执行过的命令数
+     *   other  节点号不匹配而忽略的帧 (总线上其它关节的报文)
+     *   drop   事件队列满 (8 帧) 被丢弃 —— 持续增长说明主机发得太快或
+     *          can 线程被更高优先级任务长期压制
+     *   txfail 应答发不出去 (总线无 ACK / 邮箱满 / 未接线)
+     */
+    rt_kprintf("can     : rx=%lu cmd=%lu other=%lu drop=%lu txfail=%lu\n",
+               (unsigned long)can_protocol_rx_count,
+               (unsigned long)can_protocol_cmd_count,
+               (unsigned long)can_protocol_filter_count,
+               (unsigned long)can_protocol_drop_count,
+               (unsigned long)can_protocol_tx_fail_count);
 }
 
 /*

@@ -72,6 +72,9 @@ set(FOC_SRC
 
     # --- 应用层 ---
     ${FOC_DIR}/UserApp/app_foc.c                         # 全局对象 / 20kHz 入口 / 100Hz 线程
+
+    # --- CAN 协议 (RX 中断 -> 队列 -> can 线程) ---
+    ${FOC_DIR}/UserApp/protocols/interface_can.c
 )
 
 # ---------------------------------------------------------------------------

@@ -69,7 +69,7 @@ VS Code 任务（`Ctrl+Shift+P` → `Tasks: Run Task`）：
 | PB2 / PB12 | GPIO 输入（上拉） | `BUTTON2` / `BUTTON1`（低有效） |
 | PB3 / PB4 / PB5 | SPI1_SCK / MISO / MOSI | **SPI1 重映射**，Mode 3，16 bit，9 MHz |
 | PB6 / PB7 | USART1_TX / RX | **USART1 重映射**，FinSH 控制台 |
-| PB8 / PB9 | CAN_RX / CAN_TX | **CAN1 重映射 2**，1 Mbit/s（协议未实现） |
+| PB8 / PB9 | CAN_RX / CAN_TX | **CAN1 重映射 2**，1 Mbit/s（XDrv 协议已实现） |
 | PB10 / PB11 | TIM2_CH3 / CH4 | 电流 PWM `HW_ELEC_BPWM / APWM`，70.3 kHz |
 | PC13 / PC14 | GPIO 输出 | `LED1` / `LED2`（低电平点亮） |
 | PD0 / PD1 | HSE | 12 MHz 晶振 |
@@ -84,7 +84,7 @@ VS Code 任务（`Ctrl+Shift+P` → `Tasks: Run Task`）：
 | SysTick | RT-Thread OS tick（1000 Hz） | 15（最低） |
 | PendSV | 线程上下文切换 | 15（最低） |
 | USART1 | 控制台接收 | 5 |
-| CAN1 ×4 | 未启用协议 | 3 |
+| CAN1 ×4 | 接收中断（`HAL_CAN_RxFifo0MsgPendingCallback` → 帧队列 → `can` 线程） | 3 |
 | DMA1_Ch1 | ADC（循环，未启用） | 15 |
 
 > RT-Thread 要求 SysTick / PendSV 为最低优先级，FOC 闭环为最高优先级 ——
@@ -373,6 +373,7 @@ msh > xdrv save
 │   │   └── Signal/          button_base  led_base
 │   ├── Port/                板级实现（TB67H450 / MT6816 / Flash / 按键 / LED）
 │   ├── UserApp/             app_foc.c（全局对象 + 20kHz 入口 + 100Hz 线程 + msh）
+│   │                        protocols/interface_can.c（CAN 协议 + can 线程）
 │   └── docs/FOC_C_PORT.md   C 化约定、符号对照表、进度
 ├── RT-Thread/               内核源码（4.1.1，直接编入 elf）
 ├── cmake/
@@ -462,7 +463,7 @@ powershell -ExecutionPolicy Bypass -File tools\post_cubemx_patch.ps1
 
 | 项 | 说明 |
 |---|---|
-| CAN 协议 | CAN1 硬件与位时序已配置（1 Mbit/s），应用层协议未实现 |
+| CAN 协议 | 已移植（`FOC/UserApp/protocols/interface_can.c`）：7 bit 命令 + 4 bit 节点号，节点号 0 为广播。接收中断只入队，命令在 `can` 线程执行 |
 | ADC | 母线电压 / 驱动温度采样未启用（源工程里也未被读取） |
 | step-dir 模式 | 枚举值与插补器保留，未接入引脚（PA6 现用于 1 Hz 存活指示；源工程中该功能亦未完成） |
 | 控制环占用 | 20 kHz ISR 实测 `max 37.5 µs / 50 µs` 周期（75%）。其中约 10.7 µs 是 MT6816 两次 16-bit SPI 传输，位置模式下另有少量软浮点运算（Cortex-M3 无 FPU）。若后续增加 CAN 解析等负载，需先把控制数学定点化 |
