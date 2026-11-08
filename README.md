@@ -129,6 +129,7 @@ VS Code 任务（`Ctrl+Shift+P` → `Tasks: Run Task`）：
 | `xdrv home` | 把当前位置设为零点（要求先 `off`） |
 | `xdrv save` | 保存配置到 Flash（要求先 `off`） |
 | `xdrv restore` | 恢复出厂默认配置并重启（要求先 `off`） |
+| `xdrv node [id]` | 查看／设置 CAN 节点号（0~15，0 = 广播）。不带参数时打印节点号、帧 ID 基址 / 收 / 发 ID 以及 MCU 唯一 ID |
 | `xdrv enc` | MT6816 SPI 通路探测 |
 | `xdrv jit [ms]` | 量化保持时的拖动量（默认 500 ms） |
 | `xdrv gain [kp kv ki kd]` | 查看／在线调整位置环（DCE）增益 |
@@ -138,10 +139,12 @@ VS Code 任务（`Ctrl+Shift+P` → `Tasks: Run Task`）：
 
 ```
 msh > xdrv                 # 应显示 calib: NO
+msh > xdrv node            # 新板（新 MCU）节点号会是 0，按需改：xdrv node 3
 msh > xdrv cali            # 校准（电机空载、可自由转动！）
                            # 电机会正转一圈、反转一圈，然后自动重启
 msh > xdrv                 # 现在应显示 calib: yes
 
+msh > xdrv home            # 校准后零点变了，重设零点
 msh > xdrv pos 1000        # 转到 1 圈
 msh > xdrv vel 500         # 半圈/秒
 msh > xdrv cur 300         # 300 mA 力矩
@@ -276,6 +279,20 @@ msh > xdrv save
 
 ---
 
+## CAN 协议
+
+完整的命令表、数据格式与报文示例见 **[FOC/docs/CAN_PROTOCOL.md](FOC/docs/CAN_PROTOCOL.md)**。
+
+要点：
+
+- 1 Mbit/s，标准数据帧，`StdId = (node << 7) | cmd`（node 4 bit，cmd 7 bit，小端浮点）
+- 主机发送 `base | 命令号`，驱动器应答 `base | 0x21..0x24`，`base = node × 128`
+- node 0 = 广播；新板默认 0，用 `xdrv node <id>` 或 CAN `0x11` 设置
+- 硬件过滤器全通，节点号在软件比对（不匹配的帧只计数不执行）
+- 接收中断只入队，命令在 `can` 线程执行；`xdrv status` 末行给出 `rx/cmd/other/drop/txfail`
+
+---
+
 ## 按键功能
 
 板载两个按键，**均为低电平有效**（内部上拉，按下为 0）。
@@ -384,6 +401,7 @@ msh > xdrv save
 └── 文档
     ├── RTTHREAD_PORT.md     RT-Thread 移植记录（控制台 / 中断 / 堆）
     ├── FOC/docs/FOC_C_PORT.md   C++ → C 移植约定
+    ├── FOC/docs/CAN_PROTOCOL.md CAN 协议（帧格式 / 命令表 / 报文示例）
     └── 更新计划.md           完整移植计划
 ```
 
@@ -463,7 +481,7 @@ powershell -ExecutionPolicy Bypass -File tools\post_cubemx_patch.ps1
 
 | 项 | 说明 |
 |---|---|
-| CAN 协议 | 已移植（`FOC/UserApp/protocols/interface_can.c`）：7 bit 命令 + 4 bit 节点号，节点号 0 为广播。接收中断只入队，命令在 `can` 线程执行 |
+| CAN 协议 | 已移植（`FOC/UserApp/protocols/interface_can.c`）：7 bit 命令 + 4 bit 节点号，节点号 0 为广播。接收中断只入队，命令在 `can` 线程执行。节点号用 `xdrv node <id>` 或 CAN 命令 `0x11` 设置，换板后必须重设（默认值按 MCU 唯一 ID 查表，新片落在 0） |
 | ADC | 母线电压 / 驱动温度采样未启用（源工程里也未被读取） |
 | step-dir 模式 | 枚举值与插补器保留，未接入引脚（PA6 现用于 1 Hz 存活指示；源工程中该功能亦未完成） |
 | 控制环占用 | 20 kHz ISR 实测 `max 37.5 µs / 50 µs` 周期（75%）。其中约 10.7 µs 是 MT6816 两次 16-bit SPI 传输，位置模式下另有少量软浮点运算（Cortex-M3 无 FPU）。若后续增加 CAN 解析等负载，需先把控制数学定点化 |

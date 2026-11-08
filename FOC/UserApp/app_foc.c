@@ -720,8 +720,10 @@ static void foc_cmd_status(int argc, char **argv)
 
     rt_kprintf("calib   : %s\n", calibrated ? "yes" : "NO");
     rt_kprintf("stall   : %d, overload %d\n", (int)c->is_stalled, (int)c->overload_flag);
-    rt_kprintf("cfg     : node=%u limit=%dmA vel=%d acc=%d\n",
-               (unsigned)boardConfig.can_node_id, (int)boardConfig.current_limit,
+    rt_kprintf("cfg     : node=%u base=0x%03x limit=%dmA vel=%d acc=%d\n",
+               (unsigned)boardConfig.can_node_id,
+               (unsigned)(((uint32_t)boardConfig.can_node_id & 0x0FU) << 7),
+               (int)boardConfig.current_limit,
                (int)boardConfig.velocity_limit, (int)boardConfig.velocity_acc);
 
     /*
@@ -1255,6 +1257,74 @@ static void foc_cmd_save(int argc, char **argv)
     rt_kprintf("config queued for save\n");
 }
 
+/*
+ * node —— 查看 / 设置 CAN 节点号
+ *
+ * 为什么需要: 默认节点号来自 load_board_config() 里那张"MCU 唯一 ID -> 节点号"
+ * 的硬编码表, 只覆盖 Dummy-Robot 原厂的 6 块板。换一块新 PCB (新 MCU) 后查不到,
+ * 节点号会停在 0; 而 0 在协议里表示"广播" —— 两块 0 号板同时挂上总线就会一起
+ * 执行命令。本命令提供不改代码、不接线就能改节点号的办法。
+ *
+ * 范围 0~15: 帧 ID 里节点号只占 4 bit (StdId = 节点号 << 7 | 命令号)。
+ *
+ * 修改立即对接收过滤生效 (软件比对), 落盘仍走 CONFIG_COMMIT -> 100 Hz 线程,
+ * 因此运动中也允许设置, 只是要等电机停机才真正写 Flash。
+ */
+static void foc_cmd_node(int argc, char **argv)
+{
+    int32_t node;
+
+    if (argc < 2)
+    {
+        uint64_t serial = GetSerialNumber();
+        uint32_t base = ((uint32_t)boardConfig.can_node_id & 0x0FU) << 7;
+
+        rt_kprintf("node    : %u  (StdId = (node << 7) | cmd, node 0 = broadcast)\n",
+                   (unsigned)boardConfig.can_node_id);
+        /* 帧 ID 一览: 收到什么、回复什么, 免得每次自己移位算 */
+        rt_kprintf("base id : 0x%03x  (node << 7)\n", (unsigned)base);
+        rt_kprintf("rx id   : 0x%03x .. 0x%03x  (base | 0x01 .. 0x7F)\n",
+                   (unsigned)(base | 0x01U), (unsigned)(base | 0x7FU));
+        rt_kprintf("tx id   : 0x%03x .. 0x%03x  (base | 0x21 .. 0x24)\n",
+                   (unsigned)(base | 0x21U), (unsigned)(base | 0x24U));
+        /* 高/低 32 位分开打印: rt_kprintf 不保证支持 %llu */
+        rt_kprintf("mcu id  : %08lx%08lx\n",
+                   (unsigned long)(serial >> 32),
+                   (unsigned long)(serial & 0xFFFFFFFFUL));
+        rt_kprintf("usage   : " FOC_CMD_NAME " node <0-15>\n");
+
+        return;
+    }
+
+    if ((argv[1][0] < '0') || (argv[1][0] > '9'))
+    {
+        rt_kprintf("node id must be a number 0..15\n");
+
+        return;
+    }
+
+    node = (int32_t)atoi(argv[1]);
+    if (node > 15)
+    {
+        rt_kprintf("node id must be 0..15 (only 4 bits in StdId)\n");
+
+        return;
+    }
+
+    FOC_CMD_ENTER_CRITICAL();
+    boardConfig.can_node_id = (uint32_t)node;
+    boardConfig.config_status = CONFIG_COMMIT;
+    FOC_CMD_EXIT_CRITICAL();
+
+    rt_kprintf("node id -> %d (queued for flash save)\n", (int)node);
+
+    if ((motor.controller->mode_running != MOTOR_MODE_STOP) &&
+        !motor.controller->soft_disable)
+    {
+        rt_kprintf("        flash write deferred until the motor stops\n");
+    }
+}
+
 /* ========================================================================== */
 /* 上板调试命令 (仅用于验证, 不属于上游功能)                                   */
 /* ========================================================================== */
@@ -1361,6 +1431,7 @@ static void foc_cli_usage(void)
     rt_kprintf("  brake                    short the coils (stiff, no current)\n");
     rt_kprintf("  cali | home | save       calibrate / zero / flash [need 'off']\n");
     rt_kprintf("  restore                  factory defaults + reboot [need 'off']\n");
+    rt_kprintf("  node [id]                show / set CAN node id (0-15, 0 = broadcast)\n");
     rt_kprintf("  jit [ms]                 measure holding jitter (default 500ms)\n");
     rt_kprintf("  gain [kp kv ki kd]       show / retune position loop gains\n");
     rt_kprintf("  enc  | loop <on|off>     SPI probe / 20kHz control loop\n");
@@ -1437,6 +1508,10 @@ static void foc_cmd_xdrv(int argc, char **argv)
     else if (rt_strcmp(sub, "restore") == 0)
     {
         foc_cmd_restore(argc, argv);
+    }
+    else if (rt_strcmp(sub, "node") == 0)
+    {
+        foc_cmd_node(argc, argv);
     }
     else if (rt_strcmp(sub, "enc") == 0)
     {

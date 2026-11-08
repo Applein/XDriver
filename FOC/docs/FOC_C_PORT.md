@@ -196,6 +196,7 @@ arm-none-eabi-gcc <同上 flags> \
 | `xdrv on` / `xdrv off` / `xdrv brake` | 使能 / 释放（= 停止） / 短路制动 |
 | `xdrv home` | 把当前位置设为零点（要求先 `off`） |
 | `xdrv save` | 保存配置到 Flash（要求先 `off`） |
+| `xdrv node [id]` | 查看／设置 CAN 节点号（0~15，0 = 广播）；不带参数时打印当前节点号、`node << 7` 的帧 ID 基址与收发 ID 范围、MCU 唯一 ID |
 | `xdrv enc` | MT6816 SPI 通路探测 |
 | `xdrv loop <on\|off>` | 手动启停 20 kHz 闭环 |
 | `xdrv help` / `xdrv ?` | 精简用法总览（不按子命令拆详细说明，省 Flash） |
@@ -204,6 +205,9 @@ arm-none-eabi-gcc <同上 flags> \
 `MSH_CMD_EXPORT_ALIAS` 的字面量（finsh 的宏会先字符串化参数，宏不会展开）。
 
 ### CAN 协议：`interface_can.c`
+
+完整的帧格式、命令表、字节序与报文示例见 **[CAN_PROTOCOL.md](CAN_PROTOCOL.md)**。
+本节只记录移植结构。
 
 上游 `OnCanCmd()` 在 CAN 接收中断里直接执行、直接复用 `RxData` 当应答缓冲。
 本工程改为两段式：
@@ -318,7 +322,7 @@ FOC/
       Utils/      st_hardware.{h,c}
   UserApp/        app_foc.{h,c}  common_inc.h  configurations.h
     protocols/    interface_can.{h,c}
-  docs/           FOC_C_PORT.md
+  docs/           FOC_C_PORT.md  CAN_PROTOCOL.md
 ```
 
 > `motor_types.h` 是从上游 `Motor` 类内部提取的独立头文件（枚举 + 常量），
