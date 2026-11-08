@@ -4,9 +4,10 @@
 > 本工程：`FOC/`（纯 C + RT-Thread）
 > 本次移植把上游的类/虚函数/模板改写成 `struct` + 函数指针，**不启用 C++**。
 
-`FOC/` 下的 `*.cpp` 是**上游参照实现**，不参与构建（见 `cmake/foc.cmake` 的 `FOC_SRC`
-显式列表）。转换完一个模块后，把对应 `.c` 加入列表；**等同名 `.c` 通过验证并提交后**
-再删除 `.cpp`，在此之前保留以便逐行 `git diff` 对照。
+所有模块均已 C 化，`FOC/` 下的 16 个上游 `*.cpp` **参照实现已删除**，工程只剩纯 C。
+后续维护如需对照原始实现，请查看上游工程
+`Dummy-Robot/2.Firmware/Ctrl-Step-Driver-STM32F1-fw`（不在本仓库内）。
+新增源文件仍必须显式加入 `cmake/foc.cmake` 的 `FOC_SRC` 列表。
 
 ---
 
@@ -244,9 +245,8 @@ PWM 保持最后比较值 → 电机以旧力矩继续推。因此三个命令�
 | 文件 | 原因 |
 |---|---|
 | `Port/Platform/retarget.c` | `_write` / `__io_putchar` 与 `Core/Src/syscalls.c` + `rt_board.c` 重复定义 |
-| `UserApp/protocols/interface_uart.cpp` | USART1 由 FinSH 独占，原 ASCII 协议不移植 |
-| `UserApp/main.cpp` | 改名 `app_foc.c`，避免与 `Core/Src/main.c` 冲突 |
-| `FOC/**/*.cpp` | 上游参照实现，仅用于对照 |
+| 上游 `protocols/interface_uart` | USART1 由 FinSH 独占，原 ASCII 协议不移植 |
+| 上游 `main.cpp` | 已改名 `app_foc.c`，避免与 `Core/Src/main.c` 冲突 |
 
 ---
 
@@ -266,7 +266,7 @@ FOC/
                   stockpile_config.h  stockpile_f103cb.{h,c}
       Utils/      st_hardware.{h,c}
   UserApp/        app_foc.{h,c}  common_inc.h  configurations.h
-    protocols/    interface_can.{h,c}
+    protocols/    interface_can.{h,c}   (第二阶段, 尚未创建)
   docs/           FOC_C_PORT.md
 ```
 

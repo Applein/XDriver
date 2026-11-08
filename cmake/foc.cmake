@@ -4,9 +4,9 @@
 # 重要:
 #   1. 本模块是纯 C 实现, 不启用 C++ (不需要 enable_language(CXX))
 #   2. 源文件使用【显式列表】而不是 GLOB_RECURSE, 原因:
-#        - FOC/ 下同时保存了上游的 *.cpp 作为转换参照, 它们不能参与构建
 #        - Port/Platform/retarget.c 与 Core/Src/syscalls.c + rt_board.c 冲突
 #        - 转换进度可见: 每完成一个模块就把它的 .c 加进 FOC_SRC
+#   (上游 *.cpp 参照实现已在 C 化完成后全部删除, 见 FOC/docs/FOC_C_PORT.md)
 #
 
 set(FOC_DIR ${CMAKE_SOURCE_DIR}/FOC)
@@ -78,9 +78,8 @@ set(FOC_SRC
 # 明确排除 (不要加入 FOC_SRC)
 #   Port/Platform/retarget.c              _write / __io_putchar 与
 #                                         Core/Src/syscalls.c + rt_board.c 重复定义
-#   UserApp/protocols/interface_uart.cpp  USART1 由 FinSH 独占
-#   UserApp/main.cpp                      改名 app_foc.c (避免与 Core/Src/main.c 冲突)
-#   Ctrl/**/*.cpp  Port/**/*.cpp          C++ 参照实现, 不参与构建
+#   上游 ASCII 串口协议 (原 interface_uart)  USART1 由 FinSH 独占, 不移植
+#   原 main.cpp                           已改名为 app_foc.c (避免与 Core/Src/main.c 冲突)
 # ---------------------------------------------------------------------------
 
 if(FOC_SRC)
