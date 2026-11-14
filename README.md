@@ -132,6 +132,10 @@ VS Code 任务（`Ctrl+Shift+P` → `Tasks: Run Task`）：
 | `xdrv node [id]` | 查看／设置 CAN 节点号（0~15，0 = 广播）。不带参数时打印节点号、帧 ID 基址 / 收 / 发 ID 以及 MCU 唯一 ID |
 | `xdrv enc` | MT6816 SPI 通路探测 |
 | `xdrv jit [ms]` | 量化保持时的拖动量（默认 500 ms） |
+| `xdrv encjit [ms]` | 编码器 raw/校准后读数的跳变检测（默认 1000 ms），用于区分"传感器跳"与"校准表断点" |
+| `xdrv efilt <0\|1>` | 编码器 3 点中值滤波（默认关闭，仅作用于控制路径） |
+| `xdrv wave [n]` | 导出 20 kHz 控制环的实时波形（n ≤ 256 tick，默认 12.8 ms），用于判断抖动的性质 |
+| `xdrv hold [mA]` | 最小保持电流（0 = 关闭），诊断"到位后以 1 个整步为幅度来回跳" |
 | `xdrv gain [kp kv ki kd]` | 查看／在线调整位置环（DCE）增益 |
 | `xdrv loop <on\|off>` | 手动启停 20 kHz 闭环 |
 

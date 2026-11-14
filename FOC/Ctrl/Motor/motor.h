@@ -131,6 +131,19 @@ typedef struct
 
     /* ---- 取代上游 CloseLoopControlTick() 内 static bool isFirstCalled ---- */
     bool is_first_called;
+
+    /*
+     * 最小保持电流 (mA, 0 = 关闭)
+     *
+     * 为什么需要: 位置保持时输出 = kp * p_error。命中目标后 p_error 只有
+     * 几十 counts, 于是电流只有几十 mA —— 而步进电机的齿槽转矩 (cogging)
+     * 不需要电流也存在, 足以在这么小的电流下把转子拽到相邻整步 (1.8° =
+     * 256 counts), 表现为"到位后以 1 个整步为幅度来回跳", 且与 kp 无关。
+     *
+     * 本字段强制 |output| 不低于该值 (方向沿用 foc_sign 的滞回状态),
+     * 用来验证"是否保持力矩不足"。默认 0 = 完全保持上游行为。
+     */
+    int32_t hold_current;
 } MotionController;
 
 /* 上游: Controller 的公开方法 (friend Motor 的私有方法放在 motor.c 内部声明) */
@@ -150,6 +163,9 @@ void motion_ctrl_set_disable(MotionController *self, bool disable);
 void motion_ctrl_set_brake(MotionController *self, bool brake);
 void motion_ctrl_apply_pos_as_home_offset(MotionController *self);
 void motion_ctrl_clear_stall_flag(MotionController *self);
+
+/* 最小保持电流 (mA), 0 = 关闭。用于诊断"到位后 1 个整步的来回跳"。 */
+void motion_ctrl_set_hold_current(MotionController *self, int32_t current_ma);
 
 /* -------------------------------------------------------------------------- */
 /* 上游: struct Motor::Config_t                                               */

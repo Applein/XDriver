@@ -47,8 +47,18 @@ typedef struct
     uint16_t data_tx[2];
     uint16_t data_rx[2];
     uint8_t h_count;
-} MT6816Base;
 
+    /*
+     * 3 点中值滤波 (可选, 默认关闭)
+     *
+     * 用途: 抑制"线圈通电时传感器偶发跳变"造成的控制环抖动。
+     * 只影响 rectified_angle (控制用), raw_angle 仍保留原始值供诊断。
+     * 代价: 1 个 tick (50us) 的群延迟; 高速时引入的滞后可忽略,
+     *       但会削掉真实的单 tick 大幅运动 (转速 >10 rev/s 时需谨慎)。
+     */
+    bool median_enable;
+    uint16_t median_hist[2];            /* 最近两次 raw 采样 */
+} MT6816Base;
 /* 上游: explicit MT6816Base(uint16_t* _quickCaliDataPtr) */
 void mt6816_base_init(MT6816Base *self, const MT6816PortOps *ops,
                       uint16_t *quick_cali_data);
@@ -57,5 +67,8 @@ void mt6816_base_init(MT6816Base *self, const MT6816PortOps *ops,
 bool mt6816_base_init_device(EncoderBase *encoder);          /* Init() */
 uint16_t mt6816_base_update_angle(EncoderBase *encoder);     /* UpdateAngle() */
 bool mt6816_base_is_calibrated(EncoderBase *encoder);        /* IsCalibrated() */
+
+/* 3 点中值滤波开关 (诊断/应急用, 默认关闭; 只过滤控制用的 rectified_angle) */
+void mt6816_base_set_median_filter(MT6816Base *self, bool enable);
 
 #endif /* CTRL_STEP_FW_MT6816_BASE_H */

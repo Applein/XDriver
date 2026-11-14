@@ -18,6 +18,42 @@
 #define MT6816(encoder)     ((MT6816Base *)(encoder))
 
 /* -------------------------------------------------------------------------- */
+/* 3 点环形中值 (raw 角度域, 0 ~ 16383)
+ *
+ * 用于抑制"线圈通电时传感器偶发单点跳变"。若不处理, 一次 12 counts 的假
+ * 读数会经校准表放大成 ~37 counts, 位置环随即反冲, 形成持续抖动。
+ *
+ * 环形处理: 先把差值折到 ±8192, 再比较, 避免跨越 16383 -> 0 时判错。
+ * -------------------------------------------------------------------------- */
+static uint16_t mt6816_median3(uint16_t prev2, uint16_t prev1, uint16_t cur)
+{
+    const int32_t half = ENCODER_RESOLUTION / 2;
+    int32_t x = (int32_t)((uint16_t)((uint16_t)(prev2 - prev1) + half) % ENCODER_RESOLUTION) - half;
+    int32_t y = (int32_t)((uint16_t)((uint16_t)(cur - prev1) + half) % ENCODER_RESOLUTION) - half;
+    int32_t m;
+
+    if ((x > 0) && (y > 0))
+    {
+        m = (x < y) ? x : y;            /* 两个都比中间值大 -> 取较小的那个 */
+    }
+    else if ((x < 0) && (y < 0))
+    {
+        m = (x > y) ? x : y;            /* 两个都比中间值小 -> 取较大的那个 */
+    }
+    else
+    {
+        m = 0;                          /* 中间值本身就是中值 */
+    }
+
+    return (uint16_t)(((int32_t)prev1 + m + ENCODER_RESOLUTION) % ENCODER_RESOLUTION);
+}
+
+void mt6816_base_set_median_filter(MT6816Base *self, bool enable)
+{
+    self->median_enable = enable;
+}
+
+/* -------------------------------------------------------------------------- */
 /* 上游: bool MT6816Base::Init()
  * -------------------------------------------------------------------------- */
 bool mt6816_base_init_device(EncoderBase *encoder)
@@ -91,16 +127,37 @@ uint16_t mt6816_base_update_angle(EncoderBase *encoder)
             (bool)(self->spi_raw_data.raw_data & (uint16_t)(0x0001U << 1));
     }
 
+    /* angle_data.raw_angle 始终是【未滤波】的原始值, 供 xdrv encjit 诊断 */
     self->base.angle_data.raw_angle = self->spi_raw_data.raw_angle;
 
     /*
-     * 全分辨率查表: 每个 raw angle count 对应一项精确位置, 不需要插值。
-     * 表中位置以 51200 (一圈的细分数) 取模, 因此 table[16383] (~51197)
-     * 与 table[0] (~0) 天然相邻; 51200 -> 0 的回绕由控制环自己的
-     * 跨圈检测处理 (-51197 的跳变远大于半圈阈值)。
+     * 查表用的角度: 可选 3 点中值滤波。
+     * 只过滤控制路径 (rectified_angle), 原始值保持不动, 诊断时能分辨
+     * "传感器本身在跳" 和 "滤波后仍有跳变"。
      */
-    self->base.angle_data.rectified_angle =
-        self->quick_cali_data[self->base.angle_data.raw_angle];
+    {
+        uint16_t raw_for_table = self->spi_raw_data.raw_angle;
+
+        if (self->spi_raw_data.checksum_flag)
+        {
+            if (self->median_enable)
+            {
+                raw_for_table = mt6816_median3(self->median_hist[0], self->median_hist[1],
+                                               self->spi_raw_data.raw_angle);
+            }
+
+            self->median_hist[0] = self->median_hist[1];
+            self->median_hist[1] = self->spi_raw_data.raw_angle;
+        }
+
+        /*
+         * 全分辨率查表: 每个 raw angle count 对应一项精确位置, 不需要插值。
+         * 表中位置以 51200 (一圈的细分数) 取模, 因此 table[16383] (~51197)
+         * 与 table[0] (~0) 天然相邻; 51200 -> 0 的回绕由控制环自己的
+         * 跨圈检测处理 (-51197 的跳变远大于半圈阈值)。
+         */
+        self->base.angle_data.rectified_angle = self->quick_cali_data[raw_for_table];
+    }
 
     return self->base.angle_data.rectified_angle;
 }
@@ -144,4 +201,8 @@ void mt6816_base_init(MT6816Base *self, const MT6816PortOps *ops,
     self->data_rx[0] = 0;
     self->data_rx[1] = 0;
     self->h_count = 0;
+
+    self->median_enable = false;
+    self->median_hist[0] = 0;
+    self->median_hist[1] = 0;
 }

@@ -198,6 +198,8 @@ arm-none-eabi-gcc <同上 flags> \
 | `xdrv save` | 保存配置到 Flash（要求先 `off`） |
 | `xdrv node [id]` | 查看／设置 CAN 节点号（0~15，0 = 广播）；不带参数时打印当前节点号、`node << 7` 的帧 ID 基址与收发 ID 范围、MCU 唯一 ID |
 | `xdrv enc` | MT6816 SPI 通路探测 |
+| `xdrv encjit [ms]` | 编码器两级读数的最大步进统计（区分传感器跳变与校准表断点） |
+| `xdrv hold [mA]` | 最小保持电流下限（0 = 关闭，仅诊断用，不写 Flash） |
 | `xdrv loop <on\|off>` | 手动启停 20 kHz 闭环 |
 | `xdrv help` / `xdrv ?` | 精简用法总览（不按子命令拆详细说明，省 Flash） |
 

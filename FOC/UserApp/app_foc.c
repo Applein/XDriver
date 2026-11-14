@@ -388,6 +388,25 @@ static volatile uint32_t foc_isr_count = 0;
 static volatile uint32_t foc_isr_warn_count = 0;
 static volatile uint32_t foc_isr_warn_max = 0;
 
+/* ========================================================================== */
+/* 波形捕获 (xdrv wave)                                                       */
+/*                                                                           */
+/* 在 20 kHz 中断里连续记录 N 个 tick 的 real_position 与 foc_current。       */
+/* 用来判断抖动的波形形状:                                                    */
+/*   平滑正弦          -> 线性环路不稳定 (频率随 kp 变化)                     */
+/*   方波 / 继电器式   -> bang-bang (换相符号翻转或电流饱和)                  */
+/*   阶梯 256 counts   -> 齿槽跳 / 校准表断点                                 */
+/* ========================================================================== */
+
+#define FOC_WAVE_MAX_SAMPLES    256
+
+static int16_t foc_wave_pos[FOC_WAVE_MAX_SAMPLES];
+static int16_t foc_wave_cur[FOC_WAVE_MAX_SAMPLES];
+static volatile uint16_t foc_wave_len;
+static volatile uint16_t foc_wave_target;
+static int32_t foc_wave_base;
+static volatile bool foc_wave_active;
+
 static void foc_isr_stats_init(void)
 {
     /* 使能 DWT 周期计数器 (Cortex-M3 标准做法) */
@@ -424,6 +443,19 @@ void foc_tick_20khz(void)
     if (used > foc_isr_cycles_max)
     {
         foc_isr_cycles_max = used;
+    }
+
+    /* 波形捕获 (xdrv wave): 只做两次赋值 + 自增, 对 ISR 耗时影响可忽略 */
+    if (foc_wave_active && (foc_wave_len < foc_wave_target))
+    {
+        foc_wave_pos[foc_wave_len] =
+            (int16_t)(motor.controller->real_position - foc_wave_base);
+        foc_wave_cur[foc_wave_len] = (int16_t)motor.controller->foc_current;
+        foc_wave_len++;
+        if (foc_wave_len >= foc_wave_target)
+        {
+            foc_wave_active = false;
+        }
     }
 
     /* 超期统计: 只在中断里累加计数, 不做任何打印/阻塞操作 */
@@ -718,6 +750,11 @@ static void foc_cmd_status(int argc, char **argv)
                (int)c->config->dce.kp, (int)c->config->dce.kv,
                (int)c->config->dce.ki, (int)c->config->dce.kd);
 
+    if (c->hold_current > 0)
+    {
+        rt_kprintf("hold    : %d mA minimum\n", (int)c->hold_current);
+    }
+
     rt_kprintf("calib   : %s\n", calibrated ? "yes" : "NO");
     rt_kprintf("stall   : %d, overload %d\n", (int)c->is_stalled, (int)c->overload_flag);
     rt_kprintf("cfg     : node=%u base=0x%03x limit=%dmA vel=%d acc=%d\n",
@@ -964,6 +1001,19 @@ static void foc_cmd_jit(int argc, char **argv)
         int32_t span_cnt = max_pos - min_pos;
         int32_t vspan_pp = max_vel - min_vel;
         int32_t vlimit = ((span_cnt + 1) * 2000) / FOC_JIT_WINDOW_MS;
+        uint32_t rev_hz;
+        int32_t n = (duration_ms > 0) ? duration_ms : 1;
+
+        /*
+         * 方向反转频率: 每次振荡周期有 2 次反转, 所以
+         *     rev_hz = (flips / 2) / (duration_ms / 1000) = flips * 500 / duration_ms
+         *
+         * 必须按【频率】判振荡, 不能用"占采样次数的比例":
+         * 本循环是空转 (实测 ~120k 次/秒), 260 Hz 的极限环也只占 0.4% 的
+         * 采样, 旧判据 (flips > samples/20) 永远不成立, 会把明显的振荡
+         * 误报成 "jumperry / 校准表缺陷"。
+         */
+        rev_hz = (uint32_t)(((uint64_t)flips * 500U) / (uint64_t)n);
 
         if (span_cnt <= 3)
         {
@@ -987,13 +1037,16 @@ static void foc_cmd_jit(int argc, char **argv)
                            (int)vspan_pp, (int)vlimit);
             }
         }
-        else if (flips > (samples / 20U))
+        else if (rev_hz >= 20U)
         {
-            rt_kprintf("        : oscillating -> try 'xdrv gain' to retune\n");
+            rt_kprintf("        : oscillating at ~%lu Hz -> try 'xdrv gain' to retune\n",
+                       (unsigned long)rev_hz);
         }
         else
         {
-            rt_kprintf("        : jumperry / possible calibration table defect\n");
+            rt_kprintf("        : jumperry / possible calibration table defect "
+                       "(only %lu Hz direction reversals)\n",
+                       (unsigned long)rev_hz);
         }
     }
 }
@@ -1242,6 +1295,342 @@ static void foc_cmd_home(int argc, char **argv)
     rt_kprintf("home offset applied & queued for save\n");
 }
 
+/*
+ * hold —— 最小保持电流 (诊断"到位后以 1 个整步为幅度来回跳")
+ *
+ * 用途: 位置保持时输出 = kp * p_error。命中目标后 p_error 只有几十 counts,
+ *       电流只有几十 mA; 而齿槽转矩不需要电流也存在, 足以把转子拽到相邻
+ *       整步 (1.8° = 256 counts)。这类抖动的特征是:
+ *         - 幅度 ≈ 1 个整步 (256 counts), 而不是任意值
+ *         - 调 kp 无效 (误差越小输出越小, 自我抑制)
+ *         - 关掉 kd 反而更差 (kd 虽小但确实是唯一阻尼)
+ *
+ * 本命令强制 |output| 不低于给定值, 方向沿用 foc_sign 的滞回状态。
+ *   - 加上后 span 明显掉到个位数  -> 确认"保持力矩不足", 需查转矩角/校准/电机
+ *   - 加上后仍然抖              -> 不是力矩问题, 查编码器动态读数/机械
+ *
+ * 只改 RAM, 不写 Flash (这是诊断量, 不该固化)。0 = 关闭。
+ */
+/*
+ * encjit —— 编码器原始读数/校准后读数的跳变检测
+ *
+ * 为什么需要: "到位后以 1 个整步 (256 counts) 为幅度来回跳" 有两个可能来源,
+ * 靠 jit 分不开:
+ *   (a) 传感器原始读数在跳 (SPI/磁铁/干扰)
+ *   (b) 校准表在某个 raw 索引上有断点 (查表后跳)
+ *
+ * 本命令按 20 kHz 的节奏连续采样两级角度, 统计相邻样本的最大步进:
+ *   raw  = angle_data.raw_angle        (0~16383, 每 tick 更新)
+ *   rect = angle_data.rectified_angle  (0~51199, 查表后)
+ *
+ * 判读 (电机静止/保持时):
+ *   raw  steps 只有 0~2          -> 传感器干净
+ *   raw  step 几十               -> SPI 偶发坏帧/干扰
+ *   raw 小但 rect step ≈82/256   -> 校准表断点 (82 raw = 256 counts = 1 个整步)
+ *   rect step 几十~几百且不规则  -> 校准噪声
+ *
+ * 用法: xdrv encjit [ms]    默认 1000, 上限 5000
+ *      建议在 'xdrv off' 下先测一次 (无电流、无运动), 再在保持位置时测一次对比。
+ */
+static void foc_cmd_encjit(int argc, char **argv)
+{
+    int32_t duration_ms = 1000;
+    uint16_t raw_prev;
+    uint16_t rect_prev;
+    int32_t raw_max = 0;
+    int32_t rect_max = 0;
+    uint32_t raw_jumps = 0;
+    uint32_t rect_jumps = 0;
+    uint32_t samples = 0;
+    uint16_t raw_from = 0;
+    uint16_t raw_to = 0;
+    uint16_t rect_from = 0;
+    uint16_t rect_to = 0;
+    rt_tick_t t0;
+
+    if (argc >= 2)
+    {
+        duration_ms = (int32_t)atoi(argv[1]);
+        if (duration_ms <= 0)
+        {
+            duration_ms = 1000;
+        }
+        if (duration_ms > 5000)
+        {
+            duration_ms = 5000;
+        }
+    }
+
+    raw_prev = motor.encoder->angle_data.raw_angle;
+    rect_prev = motor.encoder->angle_data.rectified_angle;
+
+    t0 = rt_tick_get();
+    while ((rt_tick_get() - t0) < (rt_tick_t)rt_tick_from_millisecond(duration_ms))
+    {
+        uint16_t raw = motor.encoder->angle_data.raw_angle;
+        uint16_t rect = motor.encoder->angle_data.rectified_angle;
+
+        /*
+         * 步进必须按【环形】算: 角度是 0~16383 / 0~51199 的环形量,
+         * 直接相减会把"16374 -> 7"这种正常回绕算成 16367 的假跳变。
+         * 折到 ±半圈后再取绝对值。
+         */
+        int32_t d_raw = (int32_t)((uint16_t)(raw - raw_prev + ENCODER_RESOLUTION / 2) %
+                                  ENCODER_RESOLUTION) - ENCODER_RESOLUTION / 2;
+        int32_t d_rect = (int32_t)((uint16_t)((uint32_t)(rect - rect_prev) +
+                                              MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS / 2U) %
+                                   MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS) -
+                         MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS / 2;
+
+        if (d_raw < 0)
+        {
+            d_raw = -d_raw;
+        }
+        if (d_rect < 0)
+        {
+            d_rect = -d_rect;
+        }
+
+        if (d_raw > raw_max)
+        {
+            raw_max = d_raw;
+            raw_from = raw_prev;
+            raw_to = raw;
+        }
+        if (d_rect > rect_max)
+        {
+            rect_max = d_rect;
+            rect_from = rect_prev;
+            rect_to = rect;
+        }
+        if (d_raw >= 8)
+        {
+            raw_jumps++;
+        }
+        if (d_rect >= 64)
+        {
+            rect_jumps++;
+        }
+
+        raw_prev = raw;
+        rect_prev = rect;
+        samples++;
+    }
+
+    rt_kprintf("encjit  : %d ms, n=%lu, raw=%u rect=%u (last)\n",
+               (int)duration_ms, (unsigned long)samples,
+               (unsigned)raw_prev, (unsigned)rect_prev);
+    rt_kprintf("        : raw  max step=%d (%u -> %u), jumps>=8 : %lu\n",
+               (int)raw_max, (unsigned)raw_from, (unsigned)raw_to,
+               (unsigned long)raw_jumps);
+    rt_kprintf("        : rect max step=%d (%u -> %u), jumps>=64: %lu\n",
+               (int)rect_max, (unsigned)rect_from, (unsigned)rect_to,
+               (unsigned long)rect_jumps);
+
+    if (raw_max >= 8)
+    {
+        rt_kprintf("        : raw jumps -> sensor noise OR real motion\n");
+        rt_kprintf("          (compare with 'xdrv off'; in cur/vel mode the shaft spins)\n");
+    }
+    else if (rect_max >= 64)
+    {
+        rt_kprintf("        : raw clean but rect jumps -> calibration table defect\n");
+        rt_kprintf("          (82 raw = 256 counts = 1 full step)\n");
+    }
+    else
+    {
+        rt_kprintf("        : both levels clean, encoder is not the problem\n");
+    }
+}
+
+/*
+ * wave —— 捕获 20 kHz 控制环的实时波形
+ *
+ * 用法: xdrv wave [n]      n = tick 数, 默认 256 (= 12.8 ms), 范围 16~256
+ *
+ * 为什么需要: jit 只给"峰峰值/频率"这类统计量, 分不清抖动的性质。
+ * 波形能直接看出来:
+ *   平滑正弦 + 周期随 kp 变化   -> 线性环路不稳定 (增益/相位裕度)
+ *   方波、每次都在 ±限幅来回    -> bang-bang (换相符号翻转、电流饱和)
+ *   阶梯 ~256 counts 的台阶     -> 齿槽跳 / 校准表断点
+ *
+ * 输出: pos 为相对捕获起点的 counts (1 圈 = 51200), cur 为 mA。
+ */
+static void foc_cmd_wave(int argc, char **argv)
+{
+    uint16_t n = FOC_WAVE_MAX_SAMPLES;
+    uint16_t i;
+    int32_t pos_min;
+    int32_t pos_max;
+    int32_t cur_min;
+    int32_t cur_max;
+    uint32_t zero_cross = 0;
+    int32_t mid;
+
+    if (argc >= 2)
+    {
+        int32_t v = (int32_t)atoi(argv[1]);
+
+        if (v < 16)
+        {
+            v = 16;
+        }
+        if (v > FOC_WAVE_MAX_SAMPLES)
+        {
+            v = FOC_WAVE_MAX_SAMPLES;
+        }
+        n = (uint16_t)v;
+    }
+
+    FOC_CMD_ENTER_CRITICAL();
+    foc_wave_base = motor.controller->real_position;
+    foc_wave_target = n;
+    foc_wave_len = 0;
+    foc_wave_active = true;
+    FOC_CMD_EXIT_CRITICAL();
+
+    /* n 个 tick @ 20 kHz = n × 50 µs; 留 2 倍余量 */
+    for (i = 0; i < (uint16_t)((n / 20U) + 20U); i++)
+    {
+        rt_thread_mdelay(1);
+        if (!foc_wave_active)
+        {
+            break;
+        }
+    }
+
+    if (foc_wave_active)
+    {
+        foc_wave_active = false;
+        rt_kprintf("wave    : capture timed out (is the 20 kHz loop running?)\n");
+
+        return;
+    }
+
+    pos_min = foc_wave_pos[0];
+    pos_max = foc_wave_pos[0];
+    cur_min = foc_wave_cur[0];
+    cur_max = foc_wave_cur[0];
+
+    for (i = 1; i < n; i++)
+    {
+        if (foc_wave_pos[i] < pos_min) { pos_min = foc_wave_pos[i]; }
+        if (foc_wave_pos[i] > pos_max) { pos_max = foc_wave_pos[i]; }
+        if (foc_wave_cur[i] < cur_min) { cur_min = foc_wave_cur[i]; }
+        if (foc_wave_cur[i] > cur_max) { cur_max = foc_wave_cur[i]; }
+    }
+
+    /* 过零次数 -> 振荡频率: 每个周期穿中值 2 次 */
+    mid = (pos_min + pos_max) / 2;
+    for (i = 1; i < n; i++)
+    {
+        int32_t a = foc_wave_pos[i - 1] - mid;
+        int32_t b = foc_wave_pos[i] - mid;
+
+        if (((a > 0) && (b < 0)) || ((a < 0) && (b > 0)))
+        {
+            zero_cross++;
+        }
+    }
+
+    rt_kprintf("wave    : %u ticks (%u ms), pos span=%d cnt, cur span=%d mA\n",
+               (unsigned)n, (unsigned)(n / 20U),
+               (int)(pos_max - pos_min), (int)(cur_max - cur_min));
+    rt_kprintf("        : crossing mid %lu times -> ~%lu Hz\n",
+               (unsigned long)zero_cross,
+               (unsigned long)(zero_cross * 10000U / (uint32_t)n));
+
+    rt_kprintf("pos     :\n");
+    for (i = 0; i < n; i++)
+    {
+        if ((i % 16U) == 0U)
+        {
+            rt_kprintf("%4u: ", (unsigned)i);
+        }
+        rt_kprintf("%5d", (int)foc_wave_pos[i]);
+        if (((i % 16U) == 15U) || ((i + 1U) == n))
+        {
+            rt_kprintf("\n");
+        }
+    }
+
+    rt_kprintf("cur     :\n");
+    for (i = 0; i < n; i++)
+    {
+        if ((i % 16U) == 0U)
+        {
+            rt_kprintf("%4u: ", (unsigned)i);
+        }
+        rt_kprintf("%5d", (int)foc_wave_cur[i]);
+        if (((i % 16U) == 15U) || ((i + 1U) == n))
+        {
+            rt_kprintf("\n");
+        }
+    }
+}
+
+/*
+ * efilt —— 编码器 3 点中值滤波开关 (应急/诊断)
+ *
+ * 背景: 若线圈通电时 MT6816 的原始读数偶发跳变 (实测 raw 最大步进 12,
+ * 相当于 0.26 机械度), 位置环会把假读数当成真实位移去追, 结果形成
+ * 200 Hz 量级的抖动。此时若 'xdrv off' 下 encjit 全 0、通电后才跳,
+ * 说明是线圈干扰 (磁/电) —— 根治要改硬件, 本命令是可临时顶住的软件滤波。
+ *
+ * 代价: 额外 1 个 tick (50us) 群延迟, 只在控制路径生效
+ *       (raw_angle 仍为原始值, xdrv encjit 依旧能看到真实跳变)。
+ */
+static void foc_cmd_efilt(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        rt_kprintf("efilt   : %s (3-point median on rectified angle)\n",
+                   mt6816.median_enable ? "on" : "off");
+        rt_kprintf("usage   : " FOC_CMD_NAME " efilt <0|1>\n");
+
+        return;
+    }
+
+    if ((rt_strcmp(argv[1], "1") == 0) || (rt_strcmp(argv[1], "on") == 0))
+    {
+        mt6816_base_set_median_filter(&mt6816, true);
+        rt_kprintf("efilt   : on  (run 'xdrv jit' to compare, 'efilt 0' to revert)\n");
+    }
+    else
+    {
+        mt6816_base_set_median_filter(&mt6816, false);
+        rt_kprintf("efilt   : off\n");
+    }
+}
+
+static void foc_cmd_hold(int argc, char **argv)
+{
+    int32_t ma;
+
+    if (argc < 2)
+    {
+        rt_kprintf("hold    : %d mA (0 = use plain kp*err)\n",
+                   (int)motor.controller->hold_current);
+        rt_kprintf("usage   : " FOC_CMD_NAME " hold <mA>   0 disables\n");
+
+        return;
+    }
+
+    ma = (int32_t)atoi(argv[1]);
+    if (ma < 0)
+    {
+        ma = 0;
+    }
+
+    FOC_CMD_ENTER_CRITICAL();
+    motion_ctrl_set_hold_current(motor.controller, ma);
+    FOC_CMD_EXIT_CRITICAL();
+
+    rt_kprintf("hold current -> %d mA (clamped to rated %d mA), run 'xdrv jit' to compare\n",
+               (int)motor.controller->hold_current,
+               (int)motor.config.motion_params.rated_current);
+}
+
 static void foc_cmd_save(int argc, char **argv)
 {
     (void)argc;
@@ -1433,6 +1822,10 @@ static void foc_cli_usage(void)
     rt_kprintf("  restore                  factory defaults + reboot [need 'off']\n");
     rt_kprintf("  node [id]                show / set CAN node id (0-15, 0 = broadcast)\n");
     rt_kprintf("  jit [ms]                 measure holding jitter (default 500ms)\n");
+    rt_kprintf("  wave [n]                 dump 20kHz position/current samples (n<=256)\n");
+    rt_kprintf("  encjit [ms]              encoder raw/rectified step check (default 1000ms)\n");
+    rt_kprintf("  efilt <0|1>              encoder 3-point median filter (default off)\n");
+    rt_kprintf("  hold [mA]                minimum holding current (0 = off, diagnostic)\n");
     rt_kprintf("  gain [kp kv ki kd]       show / retune position loop gains\n");
     rt_kprintf("  enc  | loop <on|off>     SPI probe / 20kHz control loop\n");
     rt_kprintf("\n");
@@ -1468,6 +1861,22 @@ static void foc_cmd_xdrv(int argc, char **argv)
     else if (rt_strcmp(sub, "jit") == 0)
     {
         foc_cmd_jit(argc, argv);
+    }
+    else if (rt_strcmp(sub, "hold") == 0)
+    {
+        foc_cmd_hold(argc, argv);
+    }
+    else if (rt_strcmp(sub, "encjit") == 0)
+    {
+        foc_cmd_encjit(argc, argv);
+    }
+    else if (rt_strcmp(sub, "efilt") == 0)
+    {
+        foc_cmd_efilt(argc, argv);
+    }
+    else if (rt_strcmp(sub, "wave") == 0)
+    {
+        foc_cmd_wave(argc, argv);
     }
     else if (rt_strcmp(sub, "gain") == 0)
     {

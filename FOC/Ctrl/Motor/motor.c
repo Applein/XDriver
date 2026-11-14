@@ -271,6 +271,54 @@ static void motion_ctrl_calc_dce_to_output(MotionController *self, int32_t locat
         dce->output = -self->context->config.motion_params.rated_current;
     }
 
+    /*
+     * 最小保持电流 (xdrv hold) —— 刚度下限
+     *
+     * 零误差附近 output 只有几十 mA, 抵消不了齿槽转矩 -> 转子在相邻两个
+     * 整步之间跳, 且调 kp 无效 (误差越小输出越小的自抑制循环)。
+     * 这里把幅值抬到 hold_current。
+     *
+     * 方向必须取自【闭环本来想要的输出】的符号: 若用 foc_sign 的历史方向,
+     * 电流一旦恒大于滞回阈值方向就被锁死, 变成"一直朝一个方向推"的
+     * 砰-砰控制, 幅度反而随电流增大而变大 (实测 span 265 -> 794 -> 1408)。
+     */
+    if (self->hold_current > 0)
+    {
+        int32_t hold = self->hold_current;
+        int32_t sign;
+
+        if (hold > self->context->config.motion_params.rated_current)
+        {
+            hold = self->context->config.motion_params.rated_current;
+        }
+
+        if (abs(dce->output) < hold)
+        {
+            if (dce->output > 0)
+            {
+                sign = 1;
+            }
+            else if (dce->output < 0)
+            {
+                sign = -1;
+            }
+            else if (dce->p_error > 0)
+            {
+                sign = 1;
+            }
+            else if (dce->p_error < 0)
+            {
+                sign = -1;
+            }
+            else
+            {
+                sign = (self->foc_sign != 0) ? self->foc_sign : 1;
+            }
+
+            dce->output = sign * hold;
+        }
+    }
+
     motion_ctrl_calc_current_to_output(self, dce->output);
 }
 
@@ -473,6 +521,11 @@ void motion_ctrl_clear_stall_flag(MotionController *self)
     self->stalled_time = 0;
     self->is_stalled = false;
 }
+
+/* 最小保持电流 (mA): 0 关闭; 大于 rated_current 时按 rated_current 处理 */
+void motion_ctrl_set_hold_current(MotionController *self, int32_t current_ma)
+{
+    self->hold_current = (current_ma > 0) ? current_ma : 0;}
 
 /* ========================================================================== */
 /* Motor 闭环控制                                                              */
@@ -932,8 +985,7 @@ void motor_attach_driver(Motor *self, DriverBase *driver)
 void motor_init(Motor *self)
 {
     /* 上游 Motor() 构造函数里的默认配置 (designated initializer 其余字段为 0) */
-    static const MotorConfig MOTOR_CONFIG_DEFAULT =
-    {
+    static const MotorConfig MOTOR_CONFIG_DEFAULT =    {
         .motion_params =
         {
             .encoder_home_offset = 0,
@@ -988,6 +1040,7 @@ void motor_init(Motor *self)
     self->controller_instance.mode_running = MOTOR_MODE_STOP;
     self->controller_instance.state = MOTOR_STATE_STOP;
     self->controller_instance.is_first_called = true;   /* 上游 static bool = true */
+    self->controller_instance.hold_current = 0;         /* xdrv hold: 默认关闭 */
 
     /* 4) 控制器配置 (上游 controller->AttachConfig(&config.ctrlParams)) */
     motion_ctrl_attach_config(&self->controller_instance, &self->config.ctrl_params);
