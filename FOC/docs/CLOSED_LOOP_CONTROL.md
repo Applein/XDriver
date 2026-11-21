@@ -190,7 +190,9 @@ MT6816 原始分辨率为 14 bit，一圈 16384 个原始码。平均一个原�
 1. 读取角度相关寄存器并拼接数据。
 2. 检查 16 bit 数据的偶校验，最多尝试 3 次。
 3. 校验通过后提取原始角度，更新无磁标志。
-4. 使用 `quick_cali_data[raw_angle]` 得到校正位置 `rectified_angle`。
+4. 查表得到校正位置 `rectified_angle`；`xdrv efilt 1` 打开时，先对原始角度做 3 点中值滤波再查 `quick_cali_data[]`。
+
+中值滤波只作用于控制路径 `rectified_angle`；`angle_data.raw_angle` 始终保留未滤波值，供 `xdrv encjit` 区分“传感器在跳”和“滤波后仍跳”。
 
 校验失败时不更新最后一次有效原始角度，因此控制器可能继续使用旧位置。端口超时另有失败计数和重试闩锁；它用于限制等待和尝试恢复 SPI，不等于完整的反馈失效安全停机策略。
 
@@ -211,6 +213,13 @@ $$
 这样 `51199 -> 0` 被解释为向前移动一个 count，而不是反向跳了一圈。
 
 该算法假定相邻有效采样之间的真实运动小于半圈。累计多圈位置保存在 RAM，不是断电后自动恢复的绝对多圈位置。
+
+上电时 `real_position` 先被清零，随后 20 kHz 的**第一次** tick 走特殊分支：用当前单圈校正位置 `rectified_angle` 按 `encoder_home_offset ± 半圈` 折算后直接初始化 `real_position`，然后返回，不执行控制计算。因此：
+
+- `pos` 既不会保持上电前的多圈值，也不会一直显示 0，而是当前物理角度在一圈内的绝对坐标。
+- 多圈信息丢失：断电前 `pos` 为 1500 mrev，上电后约为 500 mrev；1000 mrev 则约为 0 mrev。
+- `goal_position` 同样在 RAM 中，上电为 0；默认 `enable_motor_on_boot=false`，上电不会自动向 0 点运动。
+- 真正持久化的只有 Flash 中的 `encoder_home_offset`，所以 `xdrv pos` 的坐标基准不变。
 
 ### 6.3 速度估计
 
@@ -271,7 +280,7 @@ $$
 | `soft_position` | 当前规划得到的位置参考 |
 | `soft_velocity` | 当前规划得到的速度参考 |
 | `real_position` | 校正后累计实际位置 |
-| `est_position` | 实际位置加速度相关超前补偿 |
+| `est_position` | `real_position` 加上速度相关超前补偿，DCE 与换相都使用它 |
 | `est_velocity` | 低通差分估计速度 |
 
 运动中 DCE 追踪的是 `soft_position/soft_velocity`，不是直接每周期追最终 `goal_position`。
@@ -294,7 +303,7 @@ $$
 
 当规划位置恰好等于目标且规划速度足够小时，将规划速度和相关余数清零。这里的锁定刹车阈值作用于规划器，不是实测位置死区，也不等同于调用硬件 `driver_brake()`。
 
-实现细节：`speed_locking_brake` 在 `position_tracker_init()` 中根据当时的加速度计算；后续 `position_tracker_set_velocity_acc()` 只更新加减速度与制动距离系数，不重新计算该阈值。因此不应假设它始终等于最新配置加速度除以 1000。
+实现细节：`speed_locking_brake` 只在 `position_tracker_init()` 中按 `rated_velocity_acc / 1000` 计算一次，而这次初始化发生在 `motor_init()` 内、板级配置覆盖之前，用的是构造默认加速度 1000 圈/s²，得到 **51200 counts/s（1 圈/s）**。之后 `position_tracker_set_velocity_acc()` 只更新加减速度与制动距离系数，不重算该阈值。它既不是板级配置 100 圈/s² 对应的 5120 counts/s（相差 10 倍），也不是实测位置死区。
 
 ## 8. 位置模式的 DCE 控制
 
@@ -381,6 +390,8 @@ I_{\mathrm{cmd}}=\operatorname{clip}\left(
 $$
 
 实际代码使用 `>> 10`，输出整数 mA，再交给换相函数。
+
+`xdrv hold <mA>` 设置 `hold_current > 0` 时，限幅后还有一步最小幅值修正：若 `|output| < hold_current`，幅值抬到 `hold_current`，方向依次取 `output` 符号、`p_error` 符号、`foc_sign`（都为零时取 +1）。因此 `foc_current` 可能不等于上式结果，`status` 的 `dce out` 与 `current` 也可能不同。默认 `hold_current=0`，上式与代码一致。
 
 增益与当前 20 kHz 周期、51200 counts/圈、定点缩放绑定。修改控制频率、位置单位或电机规格后，不能直接认为原增益仍有相同物理意义。
 
@@ -628,13 +639,15 @@ xdrv save
 | 字段 | 含义及限制 |
 |---|---|
 | `state / power / mode` | 分别表示逻辑状态、出力条件和控制模式 |
-| `pos` | 相对用户零点换算的位置，显示精度低于内部 count |
+| `pos` | `real_position` 直接换算的 mrev（未减 `encoder_home_offset`），显示精度低于内部 count；零点偏移非 0 时与 `xdrv pos` 的坐标不同 |
 | `vel` | 低通差分估计速度，静止附近可能有噪声 |
 | `current` | 有符号软件电流指令 |
 | `ctrl tgt` | 最终目标 `goal_position`，不是运动中的软参考 |
 | `ctrl est / err` | 估计位置与 DCE 误差；误差可能已经限幅 |
 | `dce ki` | 积分项换算后的 mA，不是参数 `ki` |
-| `dce out` | DCE 最终电流指令 |
+| `dce out` | DCE 最终电流指令（`hold_current` 修正前） |
+| `hold` | 仅在 `hold_current > 0` 时打印，最小保持电流 |
+| `stall` | 堵转与过载标志 |
 | `cfg` | 节点、限流、速度和加速度配置 |
 | `isr / isr_warn` | 控制入口执行耗时和超过 45 μs 预算的计数 |
 | `spi_err` | SPI 端口超时计数，不涵盖所有数据质量问题 |
@@ -650,7 +663,7 @@ xdrv save
 | 输出 | 含义 |
 |---|---|
 | `span` | `real_position` 最大值减最小值，单位 counts |
-| `vspan` | 约 20 ms 窗口位置差分速度的峰峰值 |
+| `vspan` | 约 20 ms 窗口位置差分速度的峰峰值，单位 counts/s（打印标签写的是 steps/s） |
 | `ispan` | `foc_current` 指令峰峰值，单位 mA |
 | `flips` | 读到的位置变化方向反转次数，零增量不计 |
 | `samples` | shell 空转循环次数，不是 FOC 采样次数 |
@@ -659,13 +672,15 @@ xdrv save
 
 - 20 ms 窗口会平滑或漏掉某些高频振动，不能代替示波器和同步采样。
 - 窗口换算使用固定 20 ms，实际调度延迟会影响数值。
-- 峰峰值不能描述频率、相位或持续时间。
+- `vspan`/`ispan` 是峰峰值，本身不含频率与相位信息；频率只能由 `flips` 粗略换算。
 - 小 `span` 不能区分微小真实位移和编码器噪声；大 `ispan` 也不是实测相电流大。
-- 当前振荡分类把 `flips` 与 `samples/20` 比较，而空转次数受 CPU 调度影响，不是稳定的振荡判据。
-- `span` 很小但 `vspan` 异常，不能直接证明校准表断点；若使用相同位置范围和理想固定窗口，本来就有幅值约束，应先核查采样与时间计算。
+- 振荡分类用的是方向反转频率 `rev_hz = flips * 500 / duration_ms`（一个振荡周期计 2 次反转），阈值 20 Hz，不是 `flips / samples`。`flips` 仍依赖空转采样，受 CPU 调度影响，只能作粗判。
+- `span <= 3` 时，代码用 `vlimit = (span + 1) * 2000 / 20 ms` 从 `span` 反推 `vspan` 上限：`vspan <= vlimit` 打印 stable，超过才提示单次跳变并怀疑标定表。该判据只在静止保持时成立，不能单独证明校准表断点。
 - 打印的 mrev 换算用 51 counts 近似 1 mrev，而精确值为 51.2；定量分析优先使用 counts。
 
 因此应保留原始输出，结合实际运动判断，不把命令末尾的自动提示当作根因结论。
+
+其他诊断命令：`xdrv wave [n]` 才是在 20 kHz 中断里同步记录位置/电流（最多 256 点）的工具；`xdrv encjit` 用于分辨原始码跳与校正后跳变；`xdrv efilt <0|1>` 控制 3 点中值滤波；`xdrv hold` 用于验证保持力矩是否不足。
 
 ## 15. 两块同硬件一块抖动的排查流程
 
@@ -728,6 +743,7 @@ xdrv status
 | 电流显示 | 软件指令，不是实测反馈 |
 | 积分来源 | `ki` 和 `kv` 都参与 |
 | 配置优先级 | 有效 Flash 配置覆盖源码默认 |
+| 断电后的位置 | 多圈累计丢失，上电由单圈绝对角重建，`pos` 不为 0 |
 | 标定有效性 | 生成时有检查，启动存在性检查较弱 |
 | 小电流换向 | 滞回与取绝对值可造成方向不一致，影响需实测 |
 | 传感器失效保护 | 有校验、有限等待和恢复，不是完整安全停机闭环 |
